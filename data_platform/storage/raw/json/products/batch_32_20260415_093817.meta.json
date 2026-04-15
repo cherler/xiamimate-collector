@@ -1,0 +1,13 @@
+{
+  "category": "products",
+  "label": "batch_32",
+  "saved_at": "2026-04-15 09:38:17",
+  "domain": 1,
+  "asin_count": 1,
+  "asins": [
+    "B088LVLCT4"
+  ],
+  "json_file": "batch_32_20260415_093817.json.gz",
+  "compression": "gzip",
+  "is_compressed": true
+}

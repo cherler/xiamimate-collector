@@ -1,0 +1,113 @@
+table_name,field_name,field_name_cn,data_type,required,example,description
+temu_product_snapshot,product_id,商品ID,string,是,100001,Temu 商品主键也是后续多表合并主键
+temu_product_snapshot,title,商品标题,string,是,Insulated Lunch Bag,详情页标题原文保留
+temu_product_snapshot,category,类目,string,否,Home & Kitchen,当前抓到的前台类目文本
+temu_product_snapshot,price,售价,decimal,是,19.99,当前销售价
+temu_product_snapshot,original_price,划线价,decimal,否,29.99,页面展示原价或参考价
+temu_product_snapshot,discount_rate,折扣率,decimal,否,0.33,建议统一保留 0 到 1 小数
+temu_product_snapshot,sold_display,前台销量标签数值,integer,否,10500,由已售标签清洗出的累计销量代理
+temu_product_snapshot,review_count,评论总数,integer,否,328,页面累计评论数
+temu_product_snapshot,rating,评分,decimal,否,4.6,页面评分
+temu_product_snapshot,store_name,店铺名,string,否,Temu Store A,页面展示店铺名称
+temu_product_snapshot,crawl_time,抓取时间,datetime,是,2026-04-01 10:00:00,原始抓取时间戳
+temu_sku_snapshot,product_id,商品ID,string,是,100001,关联 temu_product_snapshot.product_id
+temu_sku_snapshot,sku_id,SKU ID,string,是,100001-red,规格级主键
+temu_sku_snapshot,sku_name,SKU 名称,string,否,Red,颜色或尺码文案
+temu_sku_snapshot,is_available,是否可售,integer,是,1,建议用 1 和 0 存储
+temu_sku_snapshot,max_order_qty,最大可购数,integer,否,125,页面限制购买数量可作为库存压力代理
+temu_sku_snapshot,stock_hint,库存提示,string,否,Only 125 items left,保留原始库存提示文案
+temu_sku_snapshot,crawl_time,抓取时间,datetime,是,2026-04-01 10:05:00,原始抓取时间戳
+temu_review_daily,product_id,商品ID,string,是,100001,关联商品主键
+temu_review_daily,date,统计日期,date,是,2026-04-01,按天聚合后的评论日期
+temu_review_daily,review_count,评论总数,integer,否,328,当天累计评论数
+temu_review_daily,new_review_count,新增评论数,integer,否,6,当天新增评论或差分值
+temu_review_daily,photo_review_count,带图评论数,integer,否,2,用于判断评论质量
+temu_review_daily,low_star_review_count,低星评论数,integer,否,1,用于识别差评压力
+temu_review_daily,verified_purchase_ratio,已购比例,decimal,否,0.82,如果能拿到则保留 0 到 1 小数
+temu_rank_daily,keyword,关键词,string,是,lunch bag,被监控的搜索词
+temu_rank_daily,category,类目,string,否,Home & Kitchen,搜索结果页观察到的类目
+temu_rank_daily,product_id,商品ID,string,是,100001,进入榜单的商品主键
+temu_rank_daily,rank,排名,integer,是,3,关键词结果中的位置
+temu_rank_daily,price,榜单价格,decimal,否,19.99,搜索页看到的价格
+temu_rank_daily,review_count,榜单评论数,integer,否,328,搜索页看到的评论数
+temu_rank_daily,date,统计日期,date,是,2026-04-01,按关键词按天存储
+temu_external_signal,product_id,商品ID,string,是,100001,与商品表关联
+temu_external_signal,keyword,外部关键词,string,否,lunch bag,与外部需求信号对应的关键词
+temu_external_signal,date,统计日期,date,是,2026-04-01,外部信号日期
+temu_external_signal,google_trends_index,Google Trends 指数,decimal,否,78,需求热度主特征
+temu_external_signal,amazon_same_product_count,Amazon 同款数,integer,否,24,用于交叉验证供给密度
+temu_external_signal,tiktok_heat_score,TikTok 热度分,decimal,否,61,短视频热度补充信号
+temu_external_signal,third_party_estimated_daily_sales,第三方估算日销量,decimal,否,120,无法直接拿销量时的外部代理标签
+supplier_candidate_pool,candidate_id,候选供应商ID,string,是,100001-1688-f7a4035a4f,由 product_id supplier_platform supplier_name 自动生成
+supplier_candidate_pool,product_id,商品ID,string,是,100001,当前 Temu 商品对应的候选供应商池主关联键
+supplier_candidate_pool,product_title,商品标题,string,否,Insulated Lunch Bag,来自最新 Temu 商品快照方便人工核验
+supplier_candidate_pool,product_category,商品类目,string,否,Home & Kitchen,来自最新 Temu 商品快照
+supplier_candidate_pool,temu_price,Temu 售价,decimal,否,19.49,来自最新商品快照用于供货价比较
+supplier_candidate_pool,supplier_platform,供应商平台,string,是,1688,来源平台如 1688 Alibaba ImportYeti
+supplier_candidate_pool,supplier_name,供应商名称,string,是,义乌某箱包厂,候选供应商名称
+supplier_candidate_pool,supplier_url,供应商链接,string,否,https://detail.1688.com,原始详情页或店铺链接
+supplier_candidate_pool,search_keyword,搜索词,string,否,insulated lunch bag,用于找厂时使用的关键词
+supplier_candidate_pool,image_match_score,图像匹配分,decimal,否,0.91,图搜或人工比对后的匹配度
+supplier_candidate_pool,title_match_score,标题匹配分,decimal,否,0.88,标题关键词相似度评分
+supplier_candidate_pool,spec_match_score,规格匹配分,decimal,否,0.84,规格或材质匹配评分
+supplier_candidate_pool,quoted_unit_price,供货价,decimal,否,7.8,候选供应商的单价或区间下限
+supplier_candidate_pool,price_currency,报价币种,string,否,CNY,建议统一显式记录币种
+supplier_candidate_pool,min_moq,最小起订量,integer,否,200,MOQ
+supplier_candidate_pool,sample_supported,是否支持拿样,string,否,yes,建议存 yes no unknown
+supplier_candidate_pool,country_or_region,地区,string,否,Zhejiang,供应商所在地区
+supplier_candidate_pool,lead_time_days,交期天数,integer,否,10,样品或大货交期
+supplier_candidate_pool,source_confidence,来源可信度,decimal,否,0.8,人工或规则打分
+supplier_candidate_pool,crawl_time,抓取时间,datetime,否,2026-04-03 12:00:00,采集时间
+supplier_candidate_pool,notes,备注,string,否,主图和拉链结构高度一致,候选供应商补充说明
+product_supplier_link,candidate_id,候选供应商ID,string,是,100001-1688-f7a4035a4f,关联 supplier_candidate_pool.candidate_id
+product_supplier_link,product_id,商品ID,string,是,100001,商品主键
+product_supplier_link,product_title,商品标题,string,否,Insulated Lunch Bag,便于人工查看和导出
+product_supplier_link,supplier_platform,供应商平台,string,是,1688,供应商来源平台
+product_supplier_link,supplier_name,供应商名称,string,是,义乌某箱包厂,确认后的供应商名称
+product_supplier_link,match_type,匹配类型,string,是,image_search,可填 image_search keyword_match shipment_match manual_confirm
+product_supplier_link,match_basis,匹配依据,string,否,主图一致+规格一致,记录匹配理由
+product_supplier_link,quote_price,确认报价,decimal,否,7.5,当前确认的供货价
+product_supplier_link,price_currency,报价币种,string,否,CNY,确认报价对应币种
+product_supplier_link,min_moq,确认 MOQ,integer,否,200,确认后的起订量
+product_supplier_link,contact_status,联系状态,string,否,contacted,建议存 new contacted sampled negotiated
+product_supplier_link,last_verified_at,最后核验时间,datetime,否,2026-04-03 13:00:00,最后一次人工确认时间
+product_supplier_link,notes,备注,string,否,支持贴牌和改包装,供应商补充说明
+keepa_asin_registry,asin,Amazon 商品标识,string,是,B09V3KXJPB,Amazon 标准商品编号 10 位字母数字
+keepa_asin_registry,domain,站点编码,integer,是,1,1=US 2=UK 3=DE 4=FR 5=JP 6=CA 8=IT 9=ES 10=IN
+keepa_asin_registry,product_title,商品标题,string,否,Apple iPad Air (5th Generation),Keepa API 返回的商品标题
+keepa_asin_registry,brand,品牌,string,否,Apple,Keepa API 返回的品牌名
+keepa_asin_registry,category,品类名,string,否,Tablets,Amazon 品类节点名称
+keepa_asin_registry,category_id,品类节点 ID,integer,否,172282,Amazon 品类树节点编号
+keepa_asin_registry,discovery_source,发现来源,string,否,bestseller,枚举: bestseller search seed manual
+keepa_asin_registry,search_term,搜索词,string,否,wireless earbuds,当 discovery_source 为 search 时记录搜索关键词
+keepa_asin_registry,priority,优先级,integer,否,5,越大越优先被采集 默认 0
+keepa_asin_registry,first_seen_at,首次发现时间,timestamp,是,2026-04-01 10:00:00,register_asins 写入时自动设置
+keepa_asin_registry,last_fetched_at,上次采集时间,timestamp,否,2026-04-02 08:30:00,核心状态字段: NULL=未拉取 <14天前=待更新 ≥14天内=已更新
+keepa_asin_registry,fetch_count,累计采集次数,integer,是,3,每次 mark_fetched 时 +1 默认 0
+keepa_asin_registry,is_active,是否监控中,boolean,是,true,默认 TRUE 设为 FALSE 后不再自动采集
+keepa_product_history,asin,Amazon 商品标识,string,是,B09V3KXJPB,与 keepa_asin_registry.asin 关联
+keepa_product_history,domain,站点编码,integer,是,1,与 keepa_asin_registry.domain 关联
+keepa_product_history,date,数据日期,date,是,2026-04-01,日粒度 Keepa 时间戳转换后
+keepa_product_history,amazon_price,Amazon 自营价,double,否,299.99,单位美元 Keepa csv_type 0 除以 100
+keepa_product_history,new_price,第三方新品最低价,double,否,279.99,Keepa csv_type 1 除以 100
+keepa_product_history,used_price,二手最低价,double,否,199.99,Keepa csv_type 2 除以 100
+keepa_product_history,buy_box_price,Buy Box 价格,double,否,289.99,Keepa csv_type 18 除以 100
+keepa_product_history,list_price,建议零售价,double,否,349.99,Keepa csv_type 0 的 list_price
+keepa_product_history,bsr,销量排名,bigint,否,156,Best Sellers Rank Keepa csv_type 3
+keepa_product_history,rating,评分,double,否,4.6,0-5 分 Keepa csv_type 16 除以 10
+keepa_product_history,review_count,评论数,bigint,否,12450,累计评论数 Keepa csv_type 17
+keepa_product_history,monthly_sold,月销量,bigint,否,5000,Amazon 前台 monthly_sold 标签值
+keepa_product_history,new_offer_count,新品卖家数,integer,否,38,Keepa csv_type 11
+keepa_product_history,used_offer_count,二手卖家数,integer,否,12,Keepa csv_type 12
+google_trends_daily,keyword,搜索关键词,string,是,ipad air,从商品标题自动提取或手工指定
+google_trends_daily,geo,地区,string,是,US,ISO 国家代码
+google_trends_daily,date,数据日期,date,是,2026-04-01,小时级数据经 hourly_to_daily 聚合后的日期
+google_trends_daily,trend_index,搜索热度指数,double,是,78.5,Google Trends 归一化值 0-100 日均值
+collection_log,id,日志 ID,integer,是,1,自增主键
+collection_log,collected_at,采集时间,timestamp,是,2026-04-01 12:00:00,本次运行开始时间
+collection_log,source,采集来源,string,否,auto-collect,scheduler 或 manual
+collection_log,domain,站点编码,integer,否,1,本次采集的站点
+collection_log,asin_count,采集 ASIN 数,integer,否,715,本次采集影响的 ASIN 数
+collection_log,tokens_used,消耗 token,integer,否,1430,本次消耗的 Keepa token
+collection_log,duration_seconds,耗时秒数,double,否,3600,本次运行耗时
+collection_log,error_message,错误信息,string,否,,异常信息 正常为空

@@ -1,0 +1,57 @@
+所属表,字段名,中文名,来源渠道,采集方式,频率,当前阶段,备注
+temu_product_snapshot,product_id,商品ID,Temu 商品详情页,浏览器自动化,每日,当前主流程,作为销量和售价多表主键
+temu_product_snapshot,price,售价,Temu 商品详情页,浏览器自动化,每日,当前主流程,建议统一币种和小数位
+temu_product_snapshot,discount_rate,折扣率,Temu 商品详情页,浏览器自动化,每日,当前主流程,保留 0 到 1 小数
+temu_product_snapshot,sold_display,前台销量标签数值,Temu 商品详情页,浏览器自动化,每日,当前主流程,后续做差分生成销量代理
+temu_product_snapshot,review_count,评论总数,Temu 商品详情页,浏览器自动化,每日,当前主流程,和 review_daily 对齐校验
+temu_sku_snapshot,sku_id,SKU ID,Temu SKU 规格区,浏览器自动化,每日,当前主流程,需要和 product_id 一起存
+temu_sku_snapshot,max_order_qty,最大可购数,Temu SKU 规格区,浏览器自动化,每日,当前主流程,可作为库存压力代理
+temu_sku_snapshot,stock_hint,库存提示,Temu SKU 规格区,浏览器自动化,每日,当前主流程,建议原文保留
+temu_review_daily,new_review_count,新增评论数,Temu 评论页,浏览器自动化或差分聚合,每日,当前主流程,销量代理的重要回退特征
+temu_review_daily,low_star_review_count,低星评论数,Temu 评论页,浏览器自动化或差分聚合,每日,当前主流程,用于识别差评压力
+temu_rank_daily,keyword,关键词,Temu 搜索结果页,浏览器自动化,每日,当前主流程,关键词池应单独维护
+temu_rank_daily,rank,排名,Temu 搜索结果页,浏览器自动化,每日,当前主流程,建议按 Top N 固定深度采集
+temu_external_signal,google_trends_index,Google Trends 指数,Google Trends,导出或脚本采集,每周,当前主流程,对齐到商品日期后使用
+temu_external_signal,third_party_estimated_daily_sales,第三方估算日销量,第三方工具或人工记录,每周,当前主流程,作为销量代理回退来源
+supplier_candidate_pool,candidate_id,候选供应商ID,构建脚本自动生成,脚本生成,每周,当前已支持,由 product_id supplier_platform supplier_name 自动生成
+supplier_candidate_pool,supplier_name,供应商名称,1688 或 Alibaba.com,图搜加关键词检索,每周,当前已支持,先做候选池不急着强匹配
+supplier_candidate_pool,image_match_score,图像匹配分,1688 或 Alibaba.com,图搜后人工记录或半自动,每周,当前已支持,建议保留 0 到 1 分值
+supplier_candidate_pool,quoted_unit_price,供货价,1688 或 Alibaba.com,人工或半自动,每周,当前已支持,建议记录区间下限和币种
+supplier_candidate_pool,min_moq,最小起订量,1688 或 Alibaba.com,人工或半自动,每周,当前已支持,MOQ 是筛选关键字段
+supplier_candidate_pool,source_confidence,来源可信度,构建脚本自动补齐,脚本生成,每周,当前已支持,缺失时按图搜分 标题分 规格分加权生成
+product_supplier_link,candidate_id,候选供应商ID,supplier_review 输入或脚本自动匹配,人工确认加脚本落表,每周,当前已支持,不要求手工记忆或维护
+product_supplier_link,match_type,匹配类型,1688 ImportYeti 悟空 遨虾,人工确认,每周,当前已支持,建议固定枚举值便于后续训练或排序
+product_supplier_link,contact_status,联系状态,人工维护,人工更新,每周,当前已支持,用于跟进样品和报价进度
+product_supplier_link,quote_price,确认报价,人工确认,人工更新,每周,当前已支持,确认后进入最终映射表
+keepa_asin_registry,asin,Amazon 商品标识,Keepa Bestsellers/Search API,API 自动采集,每日,已实现,storage.py register_asins() ON CONFLICT DO NOTHING
+keepa_asin_registry,domain,站点编码,Keepa API,API 自动采集,每日,已实现,1=US 2=UK 3=DE 5=JP 6=CA
+keepa_asin_registry,product_title,商品标题,Keepa Product API,API 自动采集,每日,已实现,fetch_product_history 返回
+keepa_asin_registry,brand,品牌,Keepa Product API,API 自动采集,每日,已实现,fetch_product_history 返回
+keepa_asin_registry,category,品类名,Keepa Product API,API 自动采集,每日,已实现,Amazon 品类节点名称
+keepa_asin_registry,discovery_source,发现来源,scheduler.py,脚本自动写入,每日,已实现,bestseller / search / seed / manual
+keepa_asin_registry,priority,优先级,scheduler.py,脚本自动写入,每日,已实现,越大越优先采集
+keepa_asin_registry,last_fetched_at,上次采集时间,storage.py,脚本自动写入,每日,已实现,核心状态字段 判断是否需要更新
+keepa_asin_registry,fetch_count,累计采集次数,storage.py,脚本自动写入,每日,已实现,每次 mark_fetched 时 +1
+keepa_asin_registry,is_active,是否仍在监控,storage.py,脚本自动写入,手动,已实现,默认 TRUE
+keepa_product_history,asin,Amazon 商品标识,Keepa Product API,API 自动采集,每日,已实现,~2 token/ASIN
+keepa_product_history,domain,站点编码,Keepa Product API,API 自动采集,每日,已实现,与 asin_registry 一致
+keepa_product_history,date,数据日期,Keepa Product API,API 自动采集,每日,已实现,日粒度
+keepa_product_history,amazon_price,Amazon 自营价,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 0
+keepa_product_history,new_price,第三方新品最低价,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 1
+keepa_product_history,buy_box_price,Buy Box 价格,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 18
+keepa_product_history,bsr,销量排名,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 3
+keepa_product_history,rating,评分,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 16
+keepa_product_history,review_count,评论数,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 17
+keepa_product_history,monthly_sold,月销量,Keepa Product API,API 自动采集,每日,已实现,Amazon 官方 monthly_sold 标签
+keepa_product_history,new_offer_count,新品卖家数,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 11
+keepa_product_history,used_offer_count,二手卖家数,Keepa Product API,API 自动采集,每日,已实现,Keepa csv_type 12
+google_trends_daily,keyword,搜索关键词,Google Trends (pytrends),API 自动采集,每日,已实现,从商品标题自动提取
+google_trends_daily,geo,地区,Google Trends (pytrends),API 自动采集,每日,已实现,默认 US
+google_trends_daily,date,数据日期,Google Trends (pytrends),API 自动采集,每日,已实现,小时级聚合为日级
+google_trends_daily,trend_index,搜索热度指数,Google Trends (pytrends),API 自动采集,每日,已实现,0-100 归一化值 hourly_to_daily 聚合
+collection_log,source,采集来源,scheduler.py,脚本自动写入,每次运行,已实现,auto-collect / manual
+collection_log,domain,站点编码,scheduler.py,脚本自动写入,每次运行,已实现,与 asin_registry 一致
+collection_log,asin_count,采集 ASIN 数,scheduler.py,脚本自动写入,每次运行,已实现,本次采集影响的 ASIN 数
+collection_log,tokens_used,消耗 token,scheduler.py,脚本自动写入,每次运行,已实现,本次消耗的 Keepa token 数
+collection_log,duration_seconds,耗时秒数,scheduler.py,脚本自动写入,每次运行,已实现,从开始到结束的耗时
+collection_log,error_message,错误信息,scheduler.py,脚本自动写入,每次运行,已实现,如果有异常则记录

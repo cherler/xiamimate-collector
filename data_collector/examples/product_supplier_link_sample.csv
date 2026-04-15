@@ -1,0 +1,3 @@
+candidate_id,product_id,product_title,supplier_platform,supplier_name,match_type,match_basis,quote_price,price_currency,min_moq,contact_status,last_verified_at,notes
+100001-1688-aafda2fad9,100001,Insulated Lunch Bag,1688,义乌市某箱包厂,image_search,主图一致+尺寸接近+支持拿样,7.6,CNY,200,contacted,2026-04-03 14:00:00,优先跟进样品 | 主图和拉链结构高度一致
+100002-1688-ccd5659850,100002,Travel Cosmetic Bag,1688,广州某美妆包工厂,keyword_match,标题词和材质一致,4.2,CNY,300,sampled,2026-04-03 15:00:00,等待确认拉链和内衬 | 材质和尺寸接近

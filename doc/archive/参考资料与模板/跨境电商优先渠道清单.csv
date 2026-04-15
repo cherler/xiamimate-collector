@@ -1,0 +1,17 @@
+渠道名称,渠道链接,主要用途,覆盖表,是否可下载,是否可自动化获取,当前优先级,推荐用法,备注
+Temu 商品详情页,https://www.temu.com,抓售价折扣销量标签评分店铺,temu_product_snapshot,否,是,P0,按商品池逐日抓详情页并保留原始抓取时间,当前销量和售价构建主源
+Temu SKU 规格区,https://www.temu.com,抓 SKU 可售状态和最大可购数,temu_sku_snapshot,否,是,P0,切换 SKU 后抓库存提示和购买上限,当前库存压力代理主源
+Temu 搜索结果页,https://www.temu.com/search_result.html,抓关键词排名价格带竞品密度,temu_rank_daily,否,是,P0,按关键词每天抓 Top N 结果,当前供给侧主源
+Google Trends,https://trends.google.com,补外部需求热度,temu_external_signal,是,是,P1,按关键词周更并对齐到商品侧日期,当前外部需求主源
+Amazon 同款校验,https://www.amazon.com,补同款密度和跨平台验证,temu_external_signal,否,部分,P2,用标题和图搜做同款数量核验,不是主流程但有帮助
+1688,https://www.1688.com,找同款工厂供货价 MOQ 和拿样信息,supplier_candidate_pool|product_supplier_link,部分,部分,P1,优先用 Temu 主图和标题做图搜再补关键词搜索,国内供应商首选
+Alibaba.com,https://www.alibaba.com,找外贸型供应商和 RFQ 询盘,supplier_candidate_pool|product_supplier_link,部分,部分,P1,适合验证英文货描和外贸交付能力,适合做第二供应商池
+ImportYeti,https://www.importyeti.com,通过品牌公司反查上游供应链,supplier_candidate_pool,是,部分,P2,适合成熟类目或已知品牌反查,更适合做供应链验证
+阿里悟空（待验证）,待确认,如果支持同款找货工厂画像可做高效找厂,supplier_candidate_pool,待确认,待确认,P1 待验证,优先验证是否有图搜货盘和工厂字段,等你确认入口和权限后再接
+遨虾（待验证）,待确认,如果支持货盘筛选和供应链匹配可纳入主流程,supplier_candidate_pool,待确认,待确认,P1 待验证,重点看是否有报价 MOQ 样品和履约字段,等你确认后决定是否接入
+企查查或爱企查,https://www.qcc.com,核验供应商主体和风险信息,product_supplier_link,部分,部分,P2,对已筛出的候选供应商做主体核验,适合最后确认阶段
+Keepa Bestsellers API,https://api.keepa.com/bestsellers,免费批量发现 Amazon 热销 ASIN,keepa_asin_registry,否,是（已实现）,P0,auto-collect Phase 1 自动调用 每品类返回数千~数十万 ASIN 消耗 0 token,asin_discovery.py
+Keepa Product API,https://api.keepa.com/product,拉取 ASIN 历史价格 BSR 评论 月销量,keepa_product_history,否,是（已实现）,P0,auto-collect Phase 2 自动按优先级拉取 ~2 token/ASIN INSERT OR REPLACE 去重,collectors/product.py
+Keepa Search API,https://api.keepa.com/search,按关键词搜索 Amazon 商品发现新 ASIN,keepa_asin_registry,否,是（已实现）,P1,按结果页计费 10 token/页 调度侧按单次 search 至少预留 10 token,asin_discovery.py
+Google Trends（Keepa 侧）,https://trends.google.com,按商品标题自动提取关键词采集搜索热度,google_trends_daily,是,是（已实现）,P0,auto-collect Phase 3 自动提取关键词并聚合为日级 + 8 个衍生特征,trends_features.py
+DuckDB 本地分析库,data_platform/storage/warehouse/local_analytics.duckdb,统一存储 Keepa 和 Trends 数据,keepa_asin_registry|keepa_product_history|google_trends_daily|collection_log,本地文件,是（已实现）,P0,storage.py 自动建表 INSERT ON CONFLICT 幂等写入,storage.py

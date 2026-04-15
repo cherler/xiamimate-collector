@@ -1,0 +1,31 @@
+{
+  "category": "products",
+  "label": "batch_19",
+  "saved_at": "2026-04-15 08:27:35",
+  "domain": 1,
+  "asin_count": 19,
+  "asins": [
+    "B0GMFQPDLD",
+    "B00TOVTZ7K",
+    "B07JJT7GGF",
+    "B0CLS26CYR",
+    "B0CY25M2KC",
+    "B07897HX4W",
+    "B08G3STB1N",
+    "B07QPSNZPP",
+    "B08PQ28NPB",
+    "B0FXM7RGVP",
+    "B0CJXWDFSC",
+    "B0FLJLQJR2",
+    "B098JVY4B9",
+    "B0G669C1TW",
+    "B078FHH9QC",
+    "B0FDPNHN9V",
+    "B0DNSWH1RS",
+    "B00IM3P8GS",
+    "B0CHK45HBD"
+  ],
+  "json_file": "batch_19_20260415_082733.json.gz",
+  "compression": "gzip",
+  "is_compressed": true
+}

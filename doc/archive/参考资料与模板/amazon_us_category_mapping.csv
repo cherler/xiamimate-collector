@@ -1,0 +1,31 @@
+category_id,category_en,category_cn,level,is_default,notes
+172282,Electronics,电子产品,L1,是,已测试 返回50万+ ASIN
+228013,Cell Phones & Accessories,手机及配件,L2,是,Electronics 子类
+541966,Computers & Accessories,电脑及配件,L1,是,含笔记本 台式机 配件
+16225007011,Home & Kitchen,家居厨房,L1,是,大类 SKU 量极大
+7141123011,"Clothing, Shoes & Jewelry",服装鞋靴珠宝,L1,是,含男女童装
+3760901,Sports & Outdoors,运动户外,L1,是,含健身 露营 骑行
+165793011,Baby Products,母婴用品,L1,是,
+2619526011,Beauty & Personal Care,美妆个护,L1,是,含护肤 彩妆 个人护理
+283155,Books,图书,L1,否,非跨境电商重点但 SKU 量大
+2617941011,Toys & Games,玩具及游戏,L1,否,季节性强 Q4 爆量
+1055398,Video Games,电子游戏,L1,否,含游戏主机和配件
+468642,"Patio, Lawn & Garden",庭院草坪花园,L1,否,季节性强 春夏旺季
+228239,Tools & Home Improvement,工具及家装,L1,否,五金工具 家装 灯具
+15684181,Appliances,家用电器,L1,否,大小家电
+1063498,Office Products,办公用品,L1,否,文具 打印 办公家具
+2238192011,Industrial & Scientific,工业及科学用品,L1,否,B2B 属性更强
+2619533011,Pet Supplies,宠物用品,L1,否,宠物食品 用品 服装
+11091801,Musical Instruments,乐器,L1,否,
+16310091,Automotive,汽车零配件,L1,否,含内饰外饰改装
+2972638011,"Arts, Crafts & Sewing",手工艺品及缝纫,L1,否,DIY 材料
+2350149011,Grocery & Gourmet Food,食品杂货,L1,否,仅限 FBA 配送
+1064954,Movies & TV,影视,L1,否,蓝光 DVD
+5174,CDs & Vinyl,音乐唱片,L1,否,
+3375251,Software,软件,L1,否,
+7301146011,Collectibles & Fine Art,收藏品及艺术品,L1,否,
+2625373011,Handmade Products,手工制品,L1,否,Amazon Handmade
+2335752011,Camera & Photo,相机及摄影,L2,否,Electronics 子类
+979455011,Amazon Devices & Accessories,Amazon 设备及配件,L1,否,Kindle Echo Ring 等
+10272111,Everything Else,其他,L1,否,Keepa 树名为 Everything Else
+3760911,Health & Household,健康家居及婴儿护理,L1,否,

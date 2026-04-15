@@ -1,0 +1,1654 @@
+"""自动化调度器: 定时采集 Keepa 数据.
+
+工作流 (多站点模式):
+  外层: 逐个 domain (US → GB → DE → FR → JP → ...)
+  内层: 对当前 domain, 循环执行直到所有 L1 类目完成:
+    1. 检查 token 余量
+    2. ASIN 发现: 取下一个未采集的 L1 类目 → BestSeller API → 注册 top 100 ASIN
+    3. 历史采集: 批量拉取 pending ASIN 的 history (token 不足时等待恢复)
+    4. Google Trends: 从标题提取关键词 → pytrends 采集 (免费)
+    5. 检查该 domain 剩余 L1 类目数, 若 > 0 则回到步骤 1
+  当前 domain 全部 L1 类目采完后 → 切换下一个 domain
+
+token 预算说明 (21 token/min 套餐):
+- 每分钟生成 21 token, 桶容量 = 21 × 60 = 1260 token
+- 策略: 先拉 BestSeller (50 token), 大量剩余 token 批量拉 history
+    - bestsellers: 50 token / 次 (返回品类完整排行榜, 截取 top 100)
+    - history:    2 token / ASIN (history=1 + rating=1)
+    - 每个 L1 类目: 50 (bestseller) + 200 (100 ASIN × 2) = 250 token
+    - 25 L1 × 250 = 6250 token ≈ 5 小时
+"""
+
+from __future__ import annotations
+
+import csv
+import gzip
+import json
+import logging
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .asin_discovery import (
+    KeepaAsinDiscovery,
+    SEARCH_PRODUCTS_TOKENS_PER_PAGE,
+    extract_keywords_from_title,
+    load_seed_asins,
+)
+from .business_scoring import refresh_domain_business_priorities
+from .collectors.product import (
+    KEEPA_DOMAIN_TO_GEO,
+    KeepaCollector,
+    normalize_keepa_product_snapshot,
+)
+from .storage import DuckDBStorage
+
+logger = logging.getLogger(__name__)
+
+
+def _utc_now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# 默认分类列表: 从 doc/amazon_{geo}_category_tree.csv 自动加载
+# ---------------------------------------------------------------------------
+
+# CSV 目录 (相对于项目根目录)
+_DOC_DIR = Path(__file__).resolve().parents[2] / "doc"
+_CATEGORY_CSV = _DOC_DIR / "amazon_us_category_tree.csv"  # 兼容旧引用
+
+# 产品数低于此阈值的类目不参与轮换 (过滤掉极小或空类目)
+_MIN_PRODUCT_COUNT = 50000
+
+# 所有已支持的采集 domain
+ALL_DOMAINS = sorted(KEEPA_DOMAIN_TO_GEO.keys())  # [1,2,3,4,5,6,8,9,10,11,12,13]
+
+
+def _get_category_csv_for_domain(domain: int) -> Path:
+    """根据 domain 返回对应的类目 CSV 路径."""
+    geo = KEEPA_DOMAIN_TO_GEO.get(domain, "us").lower()
+    return _DOC_DIR / f"amazon_{geo}_category_tree.csv"
+
+# 排除虚拟/数字类目 (不适合 BestSeller 商品采集)
+_EXCLUDED_CATEGORY_IDS = {
+    163856011,    # Digital Music
+    133140011,    # Kindle Store
+    2350149011,   # Apps & Games
+    18145289011,  # Audible Books & Originals
+    9013971011,   # Video Shorts
+    13727921011,  # Alexa Skills
+    2858778011,   # Prime Video
+    599858,       # Magazine Subscriptions
+    3561432011,   # Credit & Payment Cards
+    19419898011,  # Amazon Explore
+    14297978011,  # Online Learning
+    2625373011,   # Movies & TV
+    5174,         # CDs & Vinyl
+    2238192011,   # Gift Cards
+    16333372011,  # Amazon Devices & Accessories
+    10677469011,  # Amazon Autos
+    18981045011,  # Amazon Luxury
+}
+
+
+def _load_categories_from_csv(csv_path: Path = _CATEGORY_CSV,
+                               min_products: int = _MIN_PRODUCT_COUNT) -> list[int]:
+    """从 amazon_us_category_tree.csv 读取 category_id, 按 product_count 降序.
+
+    只返回 product_count >= min_products 的类目, 过滤掉数字音乐/Kindle 等
+    不适合 BestSeller 采集的虚拟类目.
+    """
+    if not csv_path.exists():
+        logger.warning(f"类目 CSV 不存在: {csv_path}, 使用内置默认列表")
+        return []
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            rows = []
+            for row in reader:
+                # strip keys for Windows \r safety
+                row = {k.strip(): v for k, v in row.items()}
+                cat_id = int(row["category_id"])
+                count = int(row.get("product_count") or 0)
+                if count >= min_products and cat_id not in _EXCLUDED_CATEGORY_IDS:
+                    rows.append((cat_id, count))
+            # 按 product_count 降序
+            rows.sort(key=lambda x: x[1], reverse=True)
+            ids = [r[0] for r in rows]
+            logger.info(f"从 CSV 加载 {len(ids)} 个类目 (product_count >= {min_products})")
+            return ids
+    except Exception as e:
+        logger.warning(f"读取类目 CSV 失败: {e}, 使用内置默认列表")
+        return []
+
+
+# 硬编码兜底 (CSV 不存在时使用)
+_FALLBACK_CATEGORIES = [
+    172282,       # Electronics
+    1055398,      # Home & Kitchen
+    3375251,      # Sports & Outdoors
+    7141123011,   # Clothing, Shoes & Jewelry
+    3760911,      # Beauty & Personal Care
+    228013,       # Tools & Home Improvement
+    165793011,    # Toys & Games
+    2619533011,   # Pet Supplies
+]
+
+DEFAULT_US_CATEGORIES = _load_categories_from_csv() or _FALLBACK_CATEGORIES
+
+
+def _load_categories_for_domain(domain: int) -> list[int]:
+    """根据 domain 加载对应类目列表."""
+    csv_path = _get_category_csv_for_domain(domain)
+    cats = _load_categories_from_csv(csv_path)
+    if cats:
+        return cats
+    if domain == 1:
+        return _FALLBACK_CATEGORIES
+    return []
+
+
+class AutoCollector:
+    """把 ASIN 发现 → 历史采集 → 关键词提取 → Google Trends 串成一个自动化流水线."""
+
+    def __init__(
+        self,
+        *,
+        keepa_base_url: str = "https://api.keepa.com/product",
+        keepa_api_key: str,
+        db_path: str | Path | None = None,
+        domain: int = 1,
+        min_tokens_reserve: int = 2,
+        tokens_per_history: int = 2,
+        stale_hours: int = 336,
+        batch_size: int = 50,
+        enable_google_trends: bool = True,
+        enable_strategy_expansion: bool = False,
+        strategy_pending_threshold: int = 200,
+        strategy_category_limit: int = 2,
+        strategy_keyword_limit: int = 5,
+        strategy_category_cooldown_hours: int = 24 * 30,
+        strategy_keyword_cooldown_hours: int = 72,
+        seed_file: str | Path | None = None,
+        categories: list[int] | None = None,
+        search_terms: list[str] | None = None,
+    ) -> None:
+        self.keepa_base_url = keepa_base_url
+        self.keepa_api_key = keepa_api_key
+        self.domain = domain
+        self.min_tokens_reserve = min_tokens_reserve
+        self.tokens_per_history = tokens_per_history
+        self.stale_hours = stale_hours
+        self.batch_size = batch_size
+        self.enable_google_trends = enable_google_trends
+        self.enable_strategy_expansion = enable_strategy_expansion
+        self.strategy_pending_threshold = strategy_pending_threshold
+        self.strategy_category_limit = strategy_category_limit
+        self.strategy_keyword_limit = strategy_keyword_limit
+        self.strategy_category_cooldown_hours = strategy_category_cooldown_hours
+        self.strategy_keyword_cooldown_hours = strategy_keyword_cooldown_hours
+        self.seed_file = seed_file
+        self.categories = categories or _load_categories_for_domain(domain)
+        self.search_terms = search_terms or []
+
+        self.storage = DuckDBStorage(db_path)
+        self.discovery = KeepaAsinDiscovery(
+            base_url=keepa_base_url,
+            api_key=keepa_api_key,
+        )
+        self.collector = KeepaCollector(
+            base_url=keepa_base_url,
+            api_key=keepa_api_key,
+        )
+
+        # 首次运行: 从 CSV 同步类目到 DuckDB category_registry
+        self._ensure_category_registry()
+
+        # Google Trends 关键词队列: 跨多次 token 等待持续消化
+        self._trends_keyword_queue: list[str] = []
+        self._trends_fetched_keywords: set[str] = set()  # 本轮已采集, 避免重复
+        self._trends_collector = None  # lazy init
+
+        # 运行统计
+        self._stats: dict[str, Any] = {
+            "asins_discovered": 0,
+            "asins_fetched": 0,
+            "asins_deactivated": 0,
+            "history_rows_ingested": 0,
+            "snapshot_rows_ingested": 0,
+            "business_scores_updated": 0,
+            "business_tier_stats": {},
+            "trends_rows_ingested": 0,
+            "strategy_categories_selected": 0,
+            "strategy_keywords_selected": 0,
+            "strategy_asins_discovered": 0,
+            "tokens_start": 0,
+            "tokens_end": 0,
+            "errors": [],
+        }
+
+    def _ensure_category_registry(self) -> None:
+        """首次运行时, 从 CSV 同步类目到 DuckDB keepa_category_registry."""
+        cat_stats = self.storage.get_category_stats(self.domain)
+        if cat_stats["total_categories"] > 0:
+            geo = KEEPA_DOMAIN_TO_GEO.get(self.domain, "?")
+            logger.info(
+                f"类目注册表 (domain={self.domain}/{geo}): "
+                f"{cat_stats['total_categories']} 个类目, "
+                f"已采集 BestSeller {cat_stats['bestseller_fetched']} 个, "
+                f"待采集 {cat_stats['bestseller_pending']} 个"
+            )
+            return
+
+        # 表为空: 从 CSV 导入
+        csv_path = _get_category_csv_for_domain(self.domain)
+        if csv_path.exists():
+            new_count = self.storage.sync_categories_from_csv(
+                csv_path=csv_path,
+                domain=self.domain,
+                excluded_ids=_EXCLUDED_CATEGORY_IDS,
+                min_products=_MIN_PRODUCT_COUNT,
+            )
+            geo = KEEPA_DOMAIN_TO_GEO.get(self.domain, "?")
+            logger.info(f"从 CSV 导入 {new_count} 个类目到 category_registry (domain={self.domain}/{geo})")
+        else:
+            logger.warning(f"类目 CSV 不存在: {csv_path}")
+
+    def run(self) -> dict[str, Any]:
+        """执行完整的自动化采集流程.
+
+        Returns
+        -------
+        dict
+            运行统计信息.
+        """
+        start_time = time.time()
+        logger.info("=== 自动采集开始 ===")
+
+        try:
+            # 0. 检查 token
+            token_info = self.collector.check_token_status()
+            tokens_left = token_info.get("tokens_left", 0)
+            self._stats["tokens_start"] = tokens_left
+            logger.info(f"当前 token 余量: {tokens_left}")
+
+            # 0.5 自动停用不活跃 ASIN
+            self._auto_deactivate()
+
+            # 1. ASIN 发现 (BestSeller 需要 50 token, token 不足时跳过发现但不阻止 Phase 2)
+            self._discover_asins()
+
+            # 2. 采集历史数据 (智能等待: token 不足时等待恢复而非退出)
+            self._fetch_histories()
+
+            # 2.5 基于最新历史与快照刷新业务优先级
+            self._refresh_business_priorities()
+
+            # 3. Google Trends (免费, 但有频率限制)
+            if self.enable_google_trends:
+                self._fetch_google_trends()
+
+            # 3.5 下一阶段自动扩张: L2/L3 shortlist + Google Trends keyword
+            self._run_strategy_expansion()
+
+        except Exception as e:
+            logger.error(f"采集过程出错: {e}", exc_info=True)
+            self._stats["errors"].append(str(e))
+
+        return self._finish(start_time)
+
+    def _finish(self, start_time: float) -> dict:
+        duration = time.time() - start_time
+        try:
+            token_info = self.collector.check_token_status()
+            self._stats["tokens_end"] = token_info.get("tokens_left", 0)
+        except Exception:
+            pass
+
+        self._stats["duration_seconds"] = round(duration, 1)
+        self._stats["tokens_consumed"] = max(
+            0, self._stats["tokens_start"] - self._stats["tokens_end"]
+        )
+
+        # 写采集日志
+        try:
+            self.storage.log_collection(
+                source="auto_collect",
+                domain=self.domain,
+                asins_requested=self._stats["asins_discovered"],
+                asins_succeeded=self._stats["asins_fetched"],
+                rows_ingested=self._stats["history_rows_ingested"],
+                tokens_before=self._stats["tokens_start"],
+                tokens_after=self._stats["tokens_end"],
+                tokens_consumed=self._stats["tokens_consumed"],
+                duration_seconds=self._stats["duration_seconds"],
+                error_message="; ".join(self._stats["errors"]) or None,
+                started_at=datetime.fromtimestamp(
+                    time.time() - self._stats["duration_seconds"],
+                    tz=timezone.utc,
+                ).strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        except Exception as e:
+            logger.error(f"写入采集日志失败: {e}")
+
+        # 附带剩余进度信息, 供外层循环判断是否继续
+        try:
+            cat_stats = self.storage.get_category_stats(self.domain)
+            self._stats["bestseller_pending"] = cat_stats["bestseller_pending"]
+        except Exception:
+            self._stats["bestseller_pending"] = 0
+        try:
+            pending_check = self.storage.get_asins_to_fetch(
+                domain=self.domain, max_count=1, stale_hours=self.stale_hours,
+            )
+            self._stats["asins_pending"] = len(pending_check)
+        except Exception:
+            self._stats["asins_pending"] = 0
+
+        logger.info(
+            f"=== 自动采集结束 === "
+            f"耗时 {self._stats['duration_seconds']}s | "
+            f"发现 {self._stats['asins_discovered']} ASIN | "
+            f"采集 {self._stats['asins_fetched']} ASIN | "
+            f"停用 {self._stats['asins_deactivated']} ASIN | "
+            f"写入 {self._stats['history_rows_ingested']} 行 | "
+            f"消耗 {self._stats['tokens_consumed']} token | "
+            f"剩余类目 {self._stats['bestseller_pending']} | "
+            f"剩余 ASIN {self._stats['asins_pending']}"
+        )
+        return dict(self._stats)
+
+    # ------------------------------------------------------------------
+    # Phase 0.5: 自动停用不活跃 ASIN
+    # ------------------------------------------------------------------
+
+    def _auto_deactivate(self) -> None:
+        """扫描注册表, 自动停用不活跃 ASIN."""
+        logger.info("--- Phase 0.5: 自动停用检测 ---")
+        try:
+            stats = self.storage.run_auto_deactivation(
+                domain=self.domain, dry_run=False
+            )
+            total = sum(stats.values())
+            self._stats["asins_deactivated"] = total
+            if total > 0:
+                logger.info(f"自动停用 {total} 个 ASIN: {stats}")
+            else:
+                logger.info("无需停用")
+        except Exception as e:
+            logger.warning(f"自动停用检测失败: {e}")
+
+    # ------------------------------------------------------------------
+    # Phase 1: ASIN 发现
+    # ------------------------------------------------------------------
+
+    def _discover_asins(self) -> None:
+        logger.info("--- Phase 1: ASIN 发现 ---")
+        all_discovered: list[dict] = []
+
+        # 1a. 从种子文件加载
+        if self.seed_file:
+            seeds = load_seed_asins(self.seed_file)
+            for s in seeds:
+                s.setdefault("discovery_source", "seed")
+            all_discovered.extend(seeds)
+            logger.info(f"从种子文件加载 {len(seeds)} 个 ASIN")
+
+        # 1b. 自动检测 DuckDB 中待采集 ASIN (未采集 / 已过期)
+        pending_count = len(self.storage.get_asins_to_fetch(
+            domain=self.domain, max_count=99999, stale_hours=self.stale_hours,
+        ))
+
+        # 优先消费注册表。只有当待采集池为空时才读下一个类目的 BestSeller
+        if pending_count > 0:
+            logger.info(f"待采集池有 {pending_count} 个 ASIN, 跳过 BestSeller")
+            if all_discovered:
+                new_count = self.storage.register_asins(all_discovered)
+                self._stats["asins_discovered"] = new_count
+            return
+
+        # 1c. 待采集池为空 → 从 category_registry 取下一个未读过 BestSeller 的类目
+        cat_stats = self.storage.get_category_stats(self.domain)
+        logger.info(
+            f"类目进度: {cat_stats['bestseller_fetched']}/{cat_stats['total_categories']} 已采集"
+        )
+
+        next_cat = self.storage.get_next_category_for_bestseller(self.domain)
+        if next_cat is None:
+            logger.info("所有类目的 BestSeller 均已采集完成, 无新类目可发现")
+            # 注册种子 ASIN (如果有)
+            if all_discovered:
+                new_count = self.storage.register_asins(all_discovered)
+                self._stats["asins_discovered"] = new_count
+            return
+
+        cat_id = next_cat["category_id"]
+        cat_name = next_cat.get("category_cn") or next_cat.get("category_en") or str(cat_id)
+
+        # BestSeller API 消耗 50 token, 先检查余量
+        try:
+            token_info = self.collector.check_token_status()
+            tokens_left = token_info.get("tokens_left", 0)
+        except Exception:
+            tokens_left = 0
+
+        if tokens_left < 50:
+            logger.info(
+                f"token 不足 ({tokens_left} < 50), 无法拉取 BestSeller, "
+                f"跳过类目 {cat_id} ({cat_name})"
+            )
+            if all_discovered:
+                new_count = self.storage.register_asins(all_discovered)
+                self._stats["asins_discovered"] = new_count
+            return
+
+        logger.info(
+            f"BestSeller: 类目 {cat_id} ({cat_name}), "
+            f"product_count={next_cat.get('product_count')}, token={tokens_left}"
+        )
+
+        try:
+            bestseller_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            all_asins, raw_payload = self.discovery.fetch_best_sellers(
+                category=cat_id, domain=self.domain
+            )
+            # 只取 top 100 ASIN
+            asins = all_asins[:100]
+
+            # 保存 BestSeller 原始 API 响应
+            raw_path = _save_raw_response(
+                raw_payload,
+                category="bestsellers",
+                label=f"cat_{cat_id}",
+                domain=self.domain,
+                asins=asins,
+            )
+            if raw_path:
+                self.storage.upsert_asin_raw_file_mappings(
+                    asins=asins,
+                    domain=self.domain,
+                    source="bestsellers",
+                    raw_file_path=raw_path,
+                )
+
+            try:
+                self.storage.log_collection(
+                    source="bestsellers",
+                    domain=self.domain,
+                    asins_requested=len(all_asins),
+                    asins_succeeded=len(asins),
+                    rows_ingested=0,
+                    tokens_before=tokens_left,
+                    tokens_after=max(0, tokens_left - 50),
+                    tokens_consumed=50,
+                    duration_seconds=None,
+                    raw_file_path=str(raw_path) if raw_path else None,
+                    error_message=None,
+                    started_at=bestseller_started_at,
+                )
+            except Exception as e:
+                logger.warning(f"写入 BestSeller 日志失败: {e}")
+
+            logger.info(
+                f"品类 {cat_id} ({cat_name}): BestSeller 返回 {len(all_asins)} 个 ASIN, "
+                f"截取 top {len(asins)}"
+            )
+
+            for asin in asins:
+                all_discovered.append({
+                    "asin": asin,
+                    "domain": self.domain,
+                    "category_id": cat_id,
+                    "discovery_source": "bestseller",
+                })
+            # 标记该类目已采集
+            self.storage.mark_category_bestseller_done(cat_id, self.domain, len(asins))
+            logger.info(
+                f"品类 {cat_id} ({cat_name}): 注册 {len(asins)} 个 ASIN, "
+                f"消耗 50 token"
+            )
+        except Exception as e:
+            logger.warning(f"品类 {cat_id} ({cat_name}) BestSeller 获取失败: {e}")
+            self._stats["errors"].append(f"bestseller_{cat_id}: {e}")
+
+        # 1d. 关键词搜索 (Keepa 定义: 10 token / 结果页)
+        for term in self.search_terms:
+            try:
+                token_info = self.collector.check_token_status()
+                required_tokens = SEARCH_PRODUCTS_TOKENS_PER_PAGE + self.min_tokens_reserve
+                if token_info.get("tokens_left", 0) < required_tokens:
+                    logger.warning(
+                        f"token 不足 ({token_info.get('tokens_left', 0)} < {required_tokens}), 跳过剩余搜索"
+                    )
+                    break
+
+                asins = self.discovery.search_products(
+                    term=term, domain=self.domain
+                )
+                for asin in asins:
+                    all_discovered.append({
+                        "asin": asin,
+                        "domain": self.domain,
+                        "search_term": term,
+                        "discovery_source": "search",
+                    })
+                logger.info(f"搜索 '{term}': 发现 {len(asins)} 个 ASIN")
+            except Exception as e:
+                logger.warning(f"搜索 '{term}' 失败: {e}")
+                self._stats["errors"].append(f"search_{term}: {e}")
+
+        # 去重后注册到 DuckDB
+        if all_discovered:
+            new_count = self.storage.register_asins(all_discovered)
+            self._stats["asins_discovered"] = new_count
+            logger.info(f"注册 {new_count} 个新 ASIN (总发现 {len(all_discovered)} 个, 去重后新增 {new_count})")
+
+    # ------------------------------------------------------------------
+    # Phase 2: 采集历史数据
+    # ------------------------------------------------------------------
+
+    def _fetch_histories(self) -> None:
+        """采集 Keepa 历史数据.
+
+        智能等待策略: token 不足时不退出, 而是根据 refillIn 等待恢复后继续,
+        直到所有待采集 ASIN 全部完成.
+        """
+        logger.info("--- Phase 2: 采集 Keepa 历史数据 ---")
+        total_fetched = 0
+        total_rows = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+
+        while True:
+            # 检查 token
+            try:
+                token_info = self.collector.check_token_status()
+                tokens_left = token_info.get("tokens_left", 0)
+                refill_in_ms = token_info.get("refill_in_ms", 60000)
+                consecutive_errors = 0  # 重置错误计数
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"检查 token 失败 ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("连续失败过多, 停止采集")
+                    break
+                time.sleep(30)
+                continue
+
+            # token 不足: 等待恢复而非退出
+            if tokens_left < self.tokens_per_history:
+                # 先看还有没有待采集的 ASIN
+                pending_check = self.storage.get_asins_to_fetch(
+                    domain=self.domain, max_count=1, stale_hours=self.stale_hours,
+                )
+                if not pending_check:
+                    logger.info("没有待采集的 ASIN, 结束")
+                    break
+
+                # 计算等待时间: refillIn 是下一个 token 恢复的毫秒数
+                wait_secs = max((refill_in_ms / 1000) + 1, 10)
+                wait_secs = min(wait_secs, 300)  # 最多等 5 分钟 (防止异常值)
+                logger.info(
+                    f"token 不足 ({tokens_left}), "
+                    f"等待 {wait_secs:.0f}s 后恢复 (还有待采集 ASIN)"
+                )
+                # 利用等待时间采集免费的 Google Trends
+                self._fetch_trends_during_wait(wait_secs)
+                continue
+
+            # 动态计算本批可采集数量: min(max_batch_size, token余量/每ASIN消耗)
+            max_asins_by_token = tokens_left // self.tokens_per_history
+            batch_limit = min(self.batch_size, max_asins_by_token)
+            if batch_limit <= 0:
+                time.sleep(60)
+                continue
+
+            # 从注册表中取待采集 ASIN
+            pending = self.storage.get_asins_to_fetch(
+                domain=self.domain,
+                max_count=batch_limit,
+                stale_hours=self.stale_hours,
+            )
+            if not pending:
+                logger.info("没有待采集的 ASIN, 结束")
+                break
+
+            asin_list = [p["asin"] for p in pending]
+            logger.info(f"本批采集 {len(asin_list)} 个 ASIN, token 余量 {tokens_left}")
+            batch_start = time.time()
+            tokens_before_batch = tokens_left
+
+            try:
+                t0 = time.time()
+                history_rows, raw = self.collector.fetch_product_history(
+                    asins=asin_list,
+                    domain=self.domain,
+                )
+                t_api = time.time()
+
+                # 检测哪些 ASIN 没有返回数据 (Keepa 查无此商品)
+                returned_asins = {r["asin"] for r in history_rows if r.get("asin")}
+                missing_asins = [a for a in asin_list if a not in returned_asins]
+                if missing_asins:
+                    self.storage.deactivate_asins(
+                        [(a, self.domain) for a in missing_asins],
+                        reason="no_data",
+                    )
+                    logger.info(f"  {len(missing_asins)} 个 ASIN 在 Keepa 中无数据, 已停用")
+
+                # 入库
+                ingested = self.storage.ingest_keepa_history(
+                    history_rows, domain=self.domain
+                )
+                t_history = time.time()
+                snapshot_rows = []
+                capture_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                for product in raw.get("raw_products", {}).get("products", []):
+                    snapshot_rows.append(
+                        normalize_keepa_product_snapshot(
+                            product,
+                            domain=self.domain,
+                            update_time=capture_time,
+                            source_url=self.keepa_base_url,
+                        )
+                    )
+                snapshot_ingested = self.storage.ingest_keepa_product_snapshots(
+                    snapshot_rows,
+                    domain=self.domain,
+                )
+                total_rows += ingested
+                total_fetched += len(asin_list)
+                self._stats["snapshot_rows_ingested"] += snapshot_ingested
+
+                # 标记已采集 + 更新元数据
+                for asin in asin_list:
+                    self.storage.mark_fetched(asin, self.domain)
+
+                # 从返回数据中更新商品标题、类目路径等元数据
+                for product in raw.get("raw_products", {}).get("products", []):
+                    cat_tree = product.get("categoryTree")
+                    category_path = None
+                    root_category_id = None
+                    if cat_tree and isinstance(cat_tree, list) and len(cat_tree) > 0:
+                        names = [n.get("name", "") for n in cat_tree if n.get("name")]
+                        if names:
+                            category_path = " > ".join(names)
+                        root_category_id = cat_tree[0].get("catId")
+
+                        # 自动注册 categoryTree 中发现的类目到 category_registry
+                        tree_cats = []
+                        for i, node in enumerate(cat_tree):
+                            tree_cats.append({
+                                "category_id": node.get("catId"),
+                                "category_en": node.get("name"),
+                                "parent_id": cat_tree[i - 1].get("catId") if i > 0 else None,
+                                "depth": i + 1,
+                                "product_count": 0,
+                            })
+                        if tree_cats:
+                            self.storage.upsert_categories_from_tree(
+                                tree_cats, domain=self.domain
+                            )
+
+                    self.storage.update_asin_metadata(
+                        product.get("asin", ""),
+                        self.domain,
+                        product_title=product.get("title"),
+                        brand=product.get("brand"),
+                        category=product.get("productGroup"),
+                        category_path=category_path,
+                        root_category_id=root_category_id,
+                    )
+
+                    # 提取关键词并保存 asin↔keyword 映射
+                    title = product.get("title", "")
+                    if title:
+                        kws = extract_keywords_from_title(title, max_keywords=3)
+                        kws = [kw for kw in kws if len(kw.split()) >= 2 and len(kw) <= 50]
+                        if kws:
+                            self.storage.upsert_asin_keywords(
+                                product.get("asin", ""), self.domain, kws
+                            )
+
+                # 保存原始 API 响应到本地
+                raw_path = _save_raw_response(
+                    raw.get("raw_products", {}),
+                    category="products",
+                    label=f"batch_{total_fetched}",
+                    domain=self.domain,
+                    asins=asin_list,
+                    compression="gzip",
+                )
+                if raw_path:
+                    self.storage.upsert_asin_raw_file_mappings(
+                        asins=asin_list,
+                        domain=self.domain,
+                        source="auto_collect",
+                        raw_file_path=raw_path,
+                    )
+
+                t_post = time.time()
+                logger.info(
+                    f"  写入 {ingested} 行历史数据, {snapshot_ingested} 行快照数据"
+                    f" (API {t_api - t0:.1f}s, 入库 {t_history - t_api:.1f}s,"
+                    f" 后处理 {t_post - t_history:.1f}s)"
+                )
+                consecutive_errors = 0
+
+                # 每批写一条采集日志, 供 Grafana 实时监控
+                try:
+                    token_now = self.collector.check_token_status()
+                    tokens_after_batch = token_now.get("tokens_left", 0)
+                except Exception:
+                    tokens_after_batch = tokens_before_batch
+                batch_duration = round(time.time() - batch_start, 1)
+                try:
+                    self.storage.log_collection(
+                        source="auto_collect",
+                        domain=self.domain,
+                        asins_requested=len(asin_list),
+                        asins_succeeded=len(returned_asins),
+                        rows_ingested=ingested,
+                        tokens_before=tokens_before_batch,
+                        tokens_after=tokens_after_batch,
+                        tokens_consumed=max(0, tokens_before_batch - tokens_after_batch),
+                        duration_seconds=batch_duration,
+                        raw_file_path=str(raw_path) if raw_path else None,
+                        error_message=None,
+                        started_at=datetime.fromtimestamp(
+                            batch_start, tz=timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                except Exception as e:
+                    logger.warning(f"写入批次日志失败: {e}")
+
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"采集 {asin_list[:3]}... 失败 ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                self._stats["errors"].append(f"history: {e}")
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("连续采集失败过多, 停止")
+                    break
+                time.sleep(30)
+
+        self._stats["asins_fetched"] = total_fetched
+        self._stats["history_rows_ingested"] = total_rows
+
+    def _refresh_business_priorities(self) -> None:
+        logger.info("--- Phase 2.5: 刷新业务评分与调度优先级 ---")
+        try:
+            result = refresh_domain_business_priorities(
+                self.storage,
+                domain=self.domain,
+            )
+            self._stats["business_scores_updated"] = result.get("scored", 0)
+            self._stats["business_tier_stats"] = result.get("tiers", {})
+            logger.info(
+                f"业务评分已刷新: {self._stats['business_scores_updated']} 个 ASIN, "
+                f"分层 {self._stats['business_tier_stats']}"
+            )
+        except Exception as e:
+            logger.warning(f"刷新业务评分失败: {e}")
+            self._stats["errors"].append(f"business_score: {e}")
+
+    @staticmethod
+    def _strategy_priority(base_priority: int, score: float | int) -> int:
+        return max(0, min(100, int(round(base_priority + float(score) * 5))))
+
+    def _run_strategy_expansion(self) -> None:
+        logger.info("--- Phase 3.5: 下一阶段自动扩张 ---")
+        if not self.enable_strategy_expansion:
+            logger.info("未启用 strategy expansion, 跳过")
+            return
+
+        pending = self.storage.get_asins_to_fetch(
+            domain=self.domain,
+            max_count=self.strategy_pending_threshold + 1,
+            stale_hours=self.stale_hours,
+        )
+        pending_count = len(pending)
+        if pending_count > self.strategy_pending_threshold:
+            logger.info(
+                f"待采集池仍有 {pending_count} 个 ASIN (> {self.strategy_pending_threshold}), 暂不做 L2/L3 / keyword 扩张"
+            )
+            return
+
+        try:
+            self._expand_shortlist_categories()
+        except Exception:
+            logger.exception("L2/L3 shortlist 扩张异常, 继续执行 keyword 扩张")
+        try:
+            self._expand_keywords()
+        except Exception:
+            logger.exception("keyword 扩张异常")
+
+    def _expand_shortlist_categories(self) -> None:
+        candidates = self.storage.get_subcategory_expansion_candidates(
+            domain=self.domain,
+            limit=self.strategy_category_limit,
+            cooldown_hours=self.strategy_category_cooldown_hours,
+        )
+        if not candidates:
+            logger.info("未找到可扩张的 L2/L3 shortlist 类目")
+            return
+
+        logger.info(f"L2/L3 shortlist 候选 {len(candidates)} 个")
+        for index, candidate in enumerate(candidates):
+            try:
+                token_info = self.collector.check_token_status()
+                tokens_before = token_info.get("tokens_left", 0)
+            except Exception:
+                tokens_before = 0
+
+            if tokens_before < 50 + self.min_tokens_reserve:
+                logger.info(f"token 不足 ({tokens_before})，跳过剩余 L2/L3 扩张")
+                logger.info("本轮未执行的 L2/L3 shortlist 候选不会写入 cooldown；后续 token 恢复后会重新参与扩张")
+                try:
+                    self.storage.log_collection(
+                        source="strategy_category_skip",
+                        domain=self.domain,
+                        asins_requested=len(candidates) - index,
+                        asins_succeeded=0,
+                        rows_ingested=0,
+                        tokens_before=tokens_before,
+                        tokens_after=tokens_before,
+                        tokens_consumed=0,
+                        duration_seconds=None,
+                        raw_file_path=None,
+                        error_message="token_insufficient",
+                        started_at=_utc_now_str(),
+                    )
+                except Exception as e:
+                    logger.warning(f"写入 L2/L3 token skip 日志失败: {e}")
+                break
+
+            category_id = int(candidate["category_id"])
+            category_name = candidate.get("category_name") or str(category_id)
+            shortlist_score = float(candidate.get("shortlist_score") or 0)
+            started_at = _utc_now_str()
+            raw_path = None
+            new_count = 0
+            requested = 0
+            error_message = None
+
+            try:
+                all_asins, raw_payload = self.discovery.fetch_best_sellers(
+                    category=category_id,
+                    domain=self.domain,
+                )
+                asins = all_asins[:100]
+                requested = len(asins)
+                priority = self._strategy_priority(65, shortlist_score)
+                discovered_rows = [
+                    {
+                        "asin": asin,
+                        "domain": self.domain,
+                        "category_id": category_id,
+                        "discovery_source": "subcategory_bestseller",
+                        "priority": priority,
+                        "notes": f"shortlist_score={shortlist_score}",
+                    }
+                    for asin in asins
+                ]
+
+                new_count = self.storage.register_asins(discovered_rows)
+                self.storage.mark_category_bestseller_done(category_id, self.domain, len(asins))
+
+                raw_path = _save_raw_response(
+                    raw_payload,
+                    category="bestsellers",
+                    label=f"subcat_{category_id}",
+                    domain=self.domain,
+                    asins=asins,
+                )
+                if raw_path:
+                    self.storage.upsert_asin_raw_file_mappings(
+                        asins=asins,
+                        domain=self.domain,
+                        source="subcategory_bestseller",
+                        raw_file_path=raw_path,
+                    )
+
+                self.storage.record_discovery_expansion(
+                    expansion_type="category",
+                    domain=self.domain,
+                    target_key=str(category_id),
+                    target_label=str(category_name),
+                    priority_score=shortlist_score,
+                    candidate_count=requested,
+                    new_asin_count=new_count,
+                    notes=(
+                        f"depth={candidate.get('category_depth')};sample_asins={candidate.get('sample_asin_count')};"
+                        f"trend={candidate.get('trend_index_30d')}"
+                    ),
+                )
+
+                self._stats["strategy_categories_selected"] += 1
+                self._stats["strategy_asins_discovered"] += new_count
+                logger.info(
+                    f"L2/L3 扩张: {category_id} ({category_name}) -> top {requested}, 新增 {new_count}, score={shortlist_score}"
+                )
+            except Exception as e:
+                error_message = str(e)
+                logger.warning(f"L2/L3 扩张失败: {category_id} ({category_name}) -> {e}")
+                self._stats["errors"].append(f"subcategory_expand_{category_id}: {e}")
+
+            try:
+                token_after = self.collector.check_token_status().get("tokens_left", tokens_before)
+            except Exception:
+                token_after = tokens_before
+
+            try:
+                self.storage.log_collection(
+                    source="strategy_category_expand",
+                    domain=self.domain,
+                    asins_requested=requested,
+                    asins_succeeded=new_count,
+                    rows_ingested=0,
+                    tokens_before=tokens_before,
+                    tokens_after=token_after,
+                    tokens_consumed=max(0, tokens_before - token_after),
+                    duration_seconds=None,
+                    raw_file_path=str(raw_path) if raw_path else None,
+                    error_message=error_message,
+                    started_at=started_at,
+                )
+            except Exception as e:
+                logger.warning(f"写入 L2/L3 扩张日志失败: {e}")
+
+    def _expand_keywords(self) -> None:
+        candidates = self.storage.get_keyword_expansion_candidates(
+            domain=self.domain,
+            limit=self.strategy_keyword_limit,
+            cooldown_hours=self.strategy_keyword_cooldown_hours,
+        )
+        if not candidates:
+            logger.info("未找到可扩张的 keyword")
+            return
+
+        logger.info(f"keyword 扩张候选 {len(candidates)} 个")
+        for index, candidate in enumerate(candidates):
+            try:
+                token_info = self.collector.check_token_status()
+                tokens_before = token_info.get("tokens_left", 0)
+            except Exception:
+                tokens_before = 0
+
+            required_tokens = SEARCH_PRODUCTS_TOKENS_PER_PAGE + self.min_tokens_reserve
+            if tokens_before < required_tokens:
+                logger.info(f"token 不足 ({tokens_before})，跳过剩余 keyword 扩张")
+                logger.info("本轮未执行的 keyword 候选不会写入 cooldown；后续 token 恢复后会重新参与扩张")
+                try:
+                    self.storage.log_collection(
+                        source="strategy_keyword_skip",
+                        domain=self.domain,
+                        asins_requested=len(candidates) - index,
+                        asins_succeeded=0,
+                        rows_ingested=0,
+                        tokens_before=tokens_before,
+                        tokens_after=tokens_before,
+                        tokens_consumed=0,
+                        duration_seconds=None,
+                        raw_file_path=None,
+                        error_message="token_insufficient",
+                        started_at=_utc_now_str(),
+                    )
+                except Exception as e:
+                    logger.warning(f"写入 keyword token skip 日志失败: {e}")
+                break
+
+            keyword = str(candidate["keyword"])
+            expand_priority = float(candidate.get("expand_priority") or 0)
+            started_at = _utc_now_str()
+            requested = 0
+            new_count = 0
+            error_message = None
+
+            try:
+                asins = self.discovery.search_products(term=keyword, domain=self.domain)
+                requested = len(asins)
+                priority = self._strategy_priority(70, expand_priority)
+                discovered_rows = [
+                    {
+                        "asin": asin,
+                        "domain": self.domain,
+                        "search_term": keyword,
+                        "discovery_source": "strategy_search",
+                        "priority": priority,
+                        "notes": f"keyword_expand_priority={expand_priority}",
+                    }
+                    for asin in asins
+                ]
+                new_count = self.storage.register_asins(discovered_rows)
+
+                self.storage.record_discovery_expansion(
+                    expansion_type="keyword",
+                    domain=self.domain,
+                    target_key=keyword,
+                    target_label=keyword,
+                    priority_score=expand_priority,
+                    candidate_count=requested,
+                    new_asin_count=new_count,
+                    notes=(
+                        f"trend_30d={candidate.get('trend_30d_avg')};growth_7d={candidate.get('trend_growth_7d')};"
+                        f"mapped_asins={candidate.get('mapped_asin_count')}"
+                    ),
+                )
+
+                self._stats["strategy_keywords_selected"] += 1
+                self._stats["strategy_asins_discovered"] += new_count
+                logger.info(
+                    f"keyword 扩张: '{keyword}' -> 返回 {requested}, 新增 {new_count}, priority={expand_priority}"
+                )
+            except Exception as e:
+                error_message = str(e)
+                logger.warning(f"keyword 扩张失败: '{keyword}' -> {e}")
+                self._stats["errors"].append(f"keyword_expand_{keyword}: {e}")
+
+            try:
+                token_after = self.collector.check_token_status().get("tokens_left", tokens_before)
+            except Exception:
+                token_after = tokens_before
+
+            try:
+                self.storage.log_collection(
+                    source="strategy_keyword_expand",
+                    domain=self.domain,
+                    asins_requested=requested,
+                    asins_succeeded=new_count,
+                    rows_ingested=0,
+                    tokens_before=tokens_before,
+                    tokens_after=token_after,
+                    tokens_consumed=max(0, tokens_before - token_after),
+                    duration_seconds=None,
+                    raw_file_path=None,
+                    error_message=error_message,
+                    started_at=started_at,
+                )
+            except Exception as e:
+                logger.warning(f"写入 keyword 扩张日志失败: {e}")
+
+    # ------------------------------------------------------------------
+    # Google Trends: 关键词队列 + token 等待期间采集
+    # ------------------------------------------------------------------
+
+    def _refill_trends_queue(self) -> None:
+        """从 DuckDB 注册表提取关键词, 补充待采集队列."""
+        if self._trends_keyword_queue:
+            return  # 队列还没消化完, 不补充
+
+        rows = self.storage.conn.execute(
+            """SELECT asin, product_title
+               FROM curated.keepa_asin_registry
+               WHERE product_title IS NOT NULL
+                 AND domain = ?
+                 AND is_active = TRUE
+               ORDER BY last_fetched_at DESC NULLS LAST
+               LIMIT 200""",
+            [self.domain],
+        ).fetchall()
+
+        all_keywords: set[str] = set()
+        mappings: list[tuple[str, int, list[str]]] = []
+        for asin, title in rows:
+            kws = extract_keywords_from_title(title, max_keywords=2)
+            # 过滤: 至少 2 个词 且 <= 50 字符 (Google Trends 安全阈值)
+            kws = [kw for kw in kws if len(kw.split()) >= 2 and len(kw) <= 50]
+            if kws:
+                all_keywords.update(kws)
+                mappings.append((asin, self.domain, kws))
+
+        # 持久化 asin↔keyword 映射
+        if mappings:
+            self.storage.upsert_asin_keywords_batch(mappings)
+
+        # 排除本轮已采集的关键词
+        new_keywords = sorted(all_keywords - self._trends_fetched_keywords)
+        if new_keywords:
+            self._trends_keyword_queue = new_keywords
+            logger.info(f"Trends 队列补充 {len(new_keywords)} 个关键词 (已采集 {len(self._trends_fetched_keywords)} 个)")
+
+    # Domain → pytrends hl 参数映射 (hl[-2:] 被 pytrends 用作 cookie 请求的 geo)
+    _DOMAIN_TO_HL: dict[int, str] = {
+        1:  "en-US",
+        2:  "en-GB",
+        3:  "de-DE",
+        4:  "fr-FR",
+        5:  "ja-JP",
+        6:  "en-CA",
+        8:  "it-IT",
+        9:  "es-ES",
+        10: "en-IN",
+        11: "es-MX",
+        12: "pt-BR",
+        13: "en-AU",
+    }
+
+    def _get_trends_collector(self):
+        """Lazy init GoogleTrendsCollector (按 domain 设置正确的 hl)."""
+        if self._trends_collector is None:
+            try:
+                from .collectors import GoogleTrendsCollector
+                hl = self._DOMAIN_TO_HL.get(self.domain, "en-US")
+                self._trends_collector = GoogleTrendsCollector(hl=hl)
+            except ImportError:
+                logger.warning("GoogleTrendsCollector 不可用 (pytrends 未安装)")
+        return self._trends_collector
+
+    @staticmethod
+    def _trends_timeframe() -> str:
+        """Google Trends 时间范围：近 3 个月.
+
+        使用 ``"today 3-m"`` 使 pytrends 返回 **日粒度** 数据。
+        之前用 365 天自定义日期范围，pytrends 只返回周粒度数据，
+        导致 keyword 扩张候选打分 (hot_days、trend_growth_7d)
+        对非 US 站点全部失效（周数据在 7 天窗口内最多 1 个点）。
+        候选打分仅依赖近 30 天窗口，90 天日粒度完全够用。
+        """
+        return "today 3-m"
+
+    def _fetch_trends_during_wait(self, wait_secs: float) -> None:
+        """在 token 等待期间采集 Google Trends (免费, 不消耗 Keepa token).
+
+        在 wait_secs 时间预算内尽量多地从关键词队列消化关键词,
+        每批 5 个关键词, pytrends 限流时提前退出.
+        """
+        if not self.enable_google_trends:
+            time.sleep(wait_secs)
+            return
+
+        collector = self._get_trends_collector()
+        if collector is None:
+            time.sleep(wait_secs)
+            return
+
+        # 补充队列
+        self._refill_trends_queue()
+        if not self._trends_keyword_queue:
+            time.sleep(wait_secs)
+            return
+
+        geo = KEEPA_DOMAIN_TO_GEO.get(self.domain, "")
+        deadline = time.time() + wait_secs
+        batches_done = 0
+
+        while self._trends_keyword_queue and time.time() < deadline:
+            # 取一批 (最多 5 个关键词)
+            batch = self._trends_keyword_queue[:5]
+            self._trends_keyword_queue = self._trends_keyword_queue[5:]
+
+            try:
+                trend_rows = collector.fetch_interest_over_time(
+                    keywords=batch,
+                    timeframe=self._trends_timeframe(),
+                    geo=geo,
+                )
+                if trend_rows:
+                    ingested = self.storage.ingest_google_trends(trend_rows)
+                    self._stats["trends_rows_ingested"] += ingested
+                    logger.info(f"  [等待期] Google Trends: {batch} → {ingested} 行")
+                self._trends_fetched_keywords.update(batch)
+                batches_done += 1
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str:
+                    # pytrends 限流, 把关键词放回队列头部, 退出等待
+                    self._trends_keyword_queue = batch + self._trends_keyword_queue
+                    logger.info(f"  [等待期] Google Trends 限流, 暂停 (已完成 {batches_done} 批)")
+                    break
+                else:
+                    logger.warning(f"  [等待期] Google Trends {batch} 失败: {e}")
+                    self._trends_fetched_keywords.update(batch)  # 标记为已尝试, 避免反复重试
+
+        # 剩余时间继续等待 (确保 token 有时间恢复)
+        remaining = deadline - time.time()
+        if remaining > 0:
+            time.sleep(remaining)
+
+    # ------------------------------------------------------------------
+    # Phase 3: Google Trends (兜底, 处理等待期间遗漏的关键词)
+    # ------------------------------------------------------------------
+
+    def _fetch_google_trends(self) -> None:
+        """从已采集的商品标题中提取关键词, 查询 Google Trends."""
+        logger.info("--- Phase 3: Google Trends ---")
+
+        # 确保 collector 使用正确的 hl (匹配当前 domain)
+
+        # 从 DuckDB 中取已有商品标题
+        rows = self.storage.conn.execute(
+            """SELECT asin, product_title
+               FROM curated.keepa_asin_registry
+               WHERE product_title IS NOT NULL
+                 AND domain = ?
+               LIMIT 100""",
+            [self.domain],
+        ).fetchall()
+
+        if not rows:
+            logger.info("没有商品标题可提取关键词, 跳过")
+            return
+
+        # 提取关键词
+        all_keywords: set[str] = set()
+        mappings: list[tuple[str, int, list[str]]] = []
+        for asin, title in rows:
+            kws = extract_keywords_from_title(title, max_keywords=2)
+            # 过滤: 至少 2 个词 且 <= 50 字符 (Google Trends 安全阈值)
+            kws = [kw for kw in kws if len(kw.split()) >= 2 and len(kw) <= 50]
+            if kws:
+                all_keywords.update(kws)
+                mappings.append((asin, self.domain, kws))
+
+        # 持久化 asin↔keyword 映射
+        if mappings:
+            self.storage.upsert_asin_keywords_batch(mappings)
+
+        if not all_keywords:
+            logger.info("未提取到有效关键词, 跳过")
+            return
+
+        logger.info(f"提取到 {len(all_keywords)} 个关键词: {list(all_keywords)[:10]}...")
+
+        # 根据 domain 确定 Google Trends 的 geo 参数
+        geo = KEEPA_DOMAIN_TO_GEO.get(self.domain, "")
+        logger.info(f"Google Trends geo: {geo!r} (domain={self.domain})")
+
+        # 排除等待期间已采集的关键词, 避免重复请求
+        all_keywords -= self._trends_fetched_keywords
+        if not all_keywords:
+            logger.info("所有关键词已在等待期间采集完成, 跳过")
+            return
+
+        # Google Trends 有频率限制, 每次少量查询
+        keywords_list = sorted(all_keywords)[:20]  # 每次最多 20 个
+
+        try:
+            trends_collector = self._get_trends_collector()
+            if trends_collector is None:
+                return
+            # pytrends 一次最多 5 个关键词
+            for i in range(0, len(keywords_list), 5):
+                batch = keywords_list[i : i + 5]
+                try:
+                    trend_rows = trends_collector.fetch_interest_over_time(
+                        keywords=batch,
+                        timeframe=self._trends_timeframe(),
+                        geo=geo,
+                    )
+                    if trend_rows:
+                        ingested = self.storage.ingest_google_trends(trend_rows)
+                        self._stats["trends_rows_ingested"] += ingested
+                        logger.info(f"  Google Trends: {batch} → {ingested} 行")
+                    self._trends_fetched_keywords.update(batch)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "429" in err_str or "rate" in err_str:
+                        logger.info(f"  Google Trends 限流, 停止本轮 (已完成 {i // 5} 批)")
+                        break
+                    logger.warning(f"  Google Trends {batch} 失败: {e}")
+                    self._trends_fetched_keywords.update(batch)
+                    time.sleep(10)
+
+        except Exception as e:
+            logger.error(f"Google Trends 采集失败: {e}")
+            self._stats["errors"].append(f"trends: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Raw response saving
+# ---------------------------------------------------------------------------
+
+_RAW_DIR = Path(__file__).resolve().parents[2] / "data_platform" / "storage" / "raw" / "json"
+
+
+def _save_raw_response(
+    payload: dict | list,
+    category: str,
+    label: str,
+    *,
+    domain: int | None = None,
+    asins: list[str] | None = None,
+    compression: str = "none",
+) -> Path | None:
+    """保存原始 API 响应到本地 JSON 文件.
+
+    文件路径:
+    - 未压缩: data_platform/storage/raw/json/{category}/{label}_{timestamp}.json
+    - gzip:   data_platform/storage/raw/json/{category}/{label}_{timestamp}.json.gz
+    元数据路径: 同目录 {label}_{timestamp}.meta.json
+
+    Returns
+    -------
+    Path or None
+        保存路径, 失败返回 None.
+    """
+    try:
+        out_dir = _RAW_DIR / category
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        if compression == "gzip":
+            path = out_dir / f"{label}_{ts}.json.gz"
+            with gzip.open(path, "wt", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, default=str)
+        else:
+            path = out_dir / f"{label}_{ts}.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, default=str)
+
+        meta_path = out_dir / f"{label}_{ts}.meta.json"
+        meta_payload = {
+            "category": category,
+            "label": label,
+            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "domain": domain,
+            "asin_count": len(asins or []),
+            "asins": asins or [],
+            "json_file": path.name,
+            "compression": compression,
+            "is_compressed": compression == "gzip",
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+
+        logger.debug(f"保存原始响应: {path}")
+        return path
+    except Exception as e:
+        logger.warning(f"保存原始响应失败: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CLI 入口 helpers
+# ---------------------------------------------------------------------------
+
+def run_auto_collect(
+    *,
+    keepa_api_key: str,
+    keepa_base_url: str = "https://api.keepa.com/product",
+    db_path: str | Path | None = None,
+    domain: int = 1,
+    categories: list[int] | None = None,
+    search_terms: list[str] | None = None,
+    seed_file: str | Path | None = None,
+    enable_google_trends: bool = False,
+    enable_strategy_expansion: bool = False,
+    strategy_pending_threshold: int = 200,
+    strategy_category_limit: int = 2,
+    strategy_keyword_limit: int = 5,
+    strategy_category_cooldown_hours: int = 24 * 30,
+    strategy_keyword_cooldown_hours: int = 72,
+    stale_hours: int = 336,
+    batch_size: int = 50,
+) -> dict[str, Any]:
+    """启动一次自动采集, 供 CLI 调用."""
+
+    collector = AutoCollector(
+        keepa_api_key=keepa_api_key,
+        keepa_base_url=keepa_base_url,
+        db_path=db_path,
+        domain=domain,
+        categories=categories,
+        search_terms=search_terms,
+        seed_file=seed_file,
+        enable_google_trends=enable_google_trends,
+        enable_strategy_expansion=enable_strategy_expansion,
+        strategy_pending_threshold=strategy_pending_threshold,
+        strategy_category_limit=strategy_category_limit,
+        strategy_keyword_limit=strategy_keyword_limit,
+        strategy_category_cooldown_hours=strategy_category_cooldown_hours,
+        strategy_keyword_cooldown_hours=strategy_keyword_cooldown_hours,
+        stale_hours=stale_hours,
+        batch_size=batch_size,
+    )
+
+    return collector.run()
+
+
+def run_auto_collect_loop(
+    *,
+    interval_minutes: int = 3,
+    keepa_api_key: str,
+    keepa_base_url: str = "https://api.keepa.com/product",
+    db_path: str | Path | None = None,
+    domain: int = 1,
+    categories: list[int] | None = None,
+    search_terms: list[str] | None = None,
+    seed_file: str | Path | None = None,
+    enable_google_trends: bool = False,
+    enable_strategy_expansion: bool = False,
+    strategy_pending_threshold: int = 200,
+    strategy_category_limit: int = 2,
+    strategy_keyword_limit: int = 5,
+    strategy_category_cooldown_hours: int = 24 * 30,
+    strategy_keyword_cooldown_hours: int = 72,
+    stale_hours: int = 336,
+    batch_size: int = 50,
+) -> None:
+    """持续循环: 每隔 interval_minutes 运行一次 auto-collect.
+
+    Token 策略 (21 token/min 套餐):
+    - 桶容量 1260 token
+    - Phase 2 (历史采集) 内部有智能等待: token 不足时等待恢复, 不退出
+    - 一轮结束 = 所有 pending ASIN 采完, 等 interval_minutes 后检查新 BestSeller
+    - Ctrl-C 优雅退出
+    """
+    round_num = 0
+    total_asins = 0
+    total_tokens = 0
+
+    logger.info(
+        f"=== 进入持续采集模式 === 轮间等待 {interval_minutes} 分钟, Ctrl-C 退出"
+    )
+
+    collect_kwargs = dict(
+        keepa_api_key=keepa_api_key,
+        keepa_base_url=keepa_base_url,
+        db_path=db_path,
+        domain=domain,
+        categories=categories,
+        search_terms=search_terms,
+        seed_file=seed_file,
+        enable_google_trends=enable_google_trends,
+        enable_strategy_expansion=enable_strategy_expansion,
+        strategy_pending_threshold=strategy_pending_threshold,
+        strategy_category_limit=strategy_category_limit,
+        strategy_keyword_limit=strategy_keyword_limit,
+        strategy_category_cooldown_hours=strategy_category_cooldown_hours,
+        strategy_keyword_cooldown_hours=strategy_keyword_cooldown_hours,
+        stale_hours=stale_hours,
+        batch_size=batch_size,
+    )
+
+    try:
+        while True:
+            round_num += 1
+            logger.info(f"--- 第 {round_num} 轮采集 ---")
+
+            try:
+                stats = run_auto_collect(**collect_kwargs)
+                total_asins += stats.get("asins_fetched", 0)
+                total_tokens += stats.get("tokens_consumed", 0)
+
+                logger.info(
+                    f"第 {round_num} 轮完成: "
+                    f"本轮采集 {stats.get('asins_fetched', 0)} ASIN, "
+                    f"消耗 {stats.get('tokens_consumed', 0)} token | "
+                    f"累计 {total_asins} ASIN, {total_tokens} token"
+                )
+            except Exception as e:
+                logger.error(f"第 {round_num} 轮出错 (不退出, 等待下一轮): {e}", exc_info=True)
+
+            # 等待下一轮
+            next_run = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            logger.info(
+                f"等待 {interval_minutes} 分钟后开始第 {round_num + 1} 轮... "
+                f"(当前 UTC {next_run})"
+            )
+            time.sleep(interval_minutes * 60)
+
+    except KeyboardInterrupt:
+        logger.info(
+            f"\n=== 持续采集已停止 === "
+            f"共 {round_num} 轮, 采集 {total_asins} ASIN, "
+            f"消耗 {total_tokens} token"
+        )
+
+
+def run_multi_domain_collect_loop(
+    *,
+    domains: list[int] | None = None,
+    interval_minutes: int = 3,
+    keepa_api_key: str,
+    keepa_base_url: str = "https://api.keepa.com/product",
+    db_path: str | Path | None = None,
+    seed_file: str | Path | None = None,
+    enable_google_trends: bool = False,
+    enable_strategy_expansion: bool = False,
+    strategy_pending_threshold: int = 200,
+    strategy_category_limit: int = 2,
+    strategy_keyword_limit: int = 5,
+    strategy_category_cooldown_hours: int = 24 * 30,
+    strategy_keyword_cooldown_hours: int = 72,
+    stale_hours: int = 336,
+    batch_size: int = 50,
+) -> None:
+    """多 domain 持续采集: 逐个 domain 完成所有 L1 类目的 top100 商品采集后再切换下一个.
+
+    策略:
+    - 外层: 遍历 domain 列表
+    - 内层: 对当前 domain 循环执行 (发现 L1 类目 BestSeller → 采集 top100 历史数据),
+      直到该 domain 所有 L1 类目均已采集完成 (bestseller_pending == 0 且 asins_pending == 0)
+    - 一个 domain 的全部 L1 类目采完后才切换到下一个 domain
+    - 所有 domain 完成一遍后等待 interval_minutes 再开始新一轮
+    """
+    target_domains = domains or ALL_DOMAINS
+    geo_names = {d: KEEPA_DOMAIN_TO_GEO.get(d, "?") for d in target_domains}
+
+    # SIGTERM 优雅退出: macOS 休眠 / launchd stop 会发 SIGTERM
+    def _handle_sigterm(signum, frame):
+        logger.info("=== 收到 SIGTERM, 正在退出 ===")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    logger.info(
+        f"=== 多站点持续采集 (逐站点完成所有 L1) === {len(target_domains)} 个 domain: "
+        + ", ".join(f"{d}/{geo_names[d]}" for d in target_domains)
+        + f", 轮间等待 {interval_minutes} 分钟, Ctrl-C 退出"
+    )
+
+    round_num = 0
+    total_asins = 0
+    total_tokens = 0
+
+    collect_kwargs = dict(
+        keepa_api_key=keepa_api_key,
+        keepa_base_url=keepa_base_url,
+        db_path=db_path,
+        seed_file=seed_file,
+        enable_google_trends=enable_google_trends,
+        enable_strategy_expansion=enable_strategy_expansion,
+        strategy_pending_threshold=strategy_pending_threshold,
+        strategy_category_limit=strategy_category_limit,
+        strategy_keyword_limit=strategy_keyword_limit,
+        strategy_category_cooldown_hours=strategy_category_cooldown_hours,
+        strategy_keyword_cooldown_hours=strategy_keyword_cooldown_hours,
+        stale_hours=stale_hours,
+        batch_size=batch_size,
+    )
+
+    try:
+        while True:
+            round_num += 1
+            logger.info(f"--- 第 {round_num} 轮 (全站点) ---")
+
+            for domain in target_domains:
+                geo = geo_names[domain]
+                logger.info(
+                    f"  >> Domain {domain}/{geo} 开始 (完成所有 L1 类目后再切换)"
+                )
+                domain_asins = 0
+                domain_tokens = 0
+                l1_round = 0
+
+                while True:
+                    l1_round += 1
+
+                    try:
+                        stats = run_auto_collect(
+                            domain=domain,
+                            **collect_kwargs,
+                        )
+                        fetched = stats.get("asins_fetched", 0)
+                        consumed = stats.get("tokens_consumed", 0)
+                        domain_asins += fetched
+                        domain_tokens += consumed
+                        total_asins += fetched
+                        total_tokens += consumed
+
+                        bs_pending = stats.get("bestseller_pending", 0)
+                        asin_pending = stats.get("asins_pending", 0)
+
+                        logger.info(
+                            f"  Domain {domain}/{geo} 第 {l1_round} 次: "
+                            f"采集 {fetched} ASIN, 消耗 {consumed} token | "
+                            f"剩余类目 {bs_pending}, 剩余 ASIN {asin_pending}"
+                        )
+
+                        # 所有 L1 类目已采集且无待处理 ASIN → 该 domain 完成
+                        if bs_pending == 0 and asin_pending == 0:
+                            logger.info(
+                                f"  Domain {domain}/{geo}: "
+                                f"所有 L1 类目已完成, 切换下一站点"
+                            )
+                            break
+
+                        # 安全阀: 本次既没发现新 ASIN 也没采集任何数据 → 避免死循环
+                        if fetched == 0 and stats.get("asins_discovered", 0) == 0:
+                            logger.info(
+                                f"  Domain {domain}/{geo}: "
+                                f"本次无新发现或采集 (可能 token 不足), "
+                                f"等待 {interval_minutes} 分钟后重试"
+                            )
+                            time.sleep(interval_minutes * 60)
+
+                    except Exception as e:
+                        logger.error(
+                            f"  !! Domain {domain}/{geo} 第 {l1_round} 次出错: {e}",
+                            exc_info=True,
+                        )
+                        # 出错后等一会再重试, 不立刻切域
+                        time.sleep(60)
+                        # 连续出错多次则跳过该 domain
+                        if l1_round >= 3 and domain_asins == 0:
+                            logger.error(
+                                f"  Domain {domain}/{geo}: 连续失败且无进展, 跳过"
+                            )
+                            break
+
+                logger.info(
+                    f"  << Domain {domain}/{geo} 完成: "
+                    f"共采集 {domain_asins} ASIN, 消耗 {domain_tokens} token"
+                )
+
+            logger.info(
+                f"第 {round_num} 轮完成 | 累计 {total_asins} ASIN, {total_tokens} token"
+            )
+            next_run = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            logger.info(
+                f"等待 {interval_minutes} 分钟后开始第 {round_num + 1} 轮... "
+                f"(当前 UTC {next_run})"
+            )
+            time.sleep(interval_minutes * 60)
+
+    except (KeyboardInterrupt, SystemExit):
+        logger.info(
+            f"\n=== 多站点采集已停止 === "
+            f"共 {round_num} 轮, 采集 {total_asins} ASIN, "
+            f"消耗 {total_tokens} token"
+        )

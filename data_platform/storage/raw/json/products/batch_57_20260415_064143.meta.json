@@ -1,0 +1,14 @@
+{
+  "category": "products",
+  "label": "batch_57",
+  "saved_at": "2026-04-15 06:41:43",
+  "domain": 2,
+  "asin_count": 2,
+  "asins": [
+    "B07L5742RV",
+    "B0DPXP5GWK"
+  ],
+  "json_file": "batch_57_20260415_064143.json.gz",
+  "compression": "gzip",
+  "is_compressed": true
+}

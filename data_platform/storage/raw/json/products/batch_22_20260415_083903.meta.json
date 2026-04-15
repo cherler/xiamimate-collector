@@ -1,0 +1,20 @@
+{
+  "category": "products",
+  "label": "batch_22",
+  "saved_at": "2026-04-15 08:39:04",
+  "domain": 1,
+  "asin_count": 8,
+  "asins": [
+    "B00TS3FWQW",
+    "B0DHKV7ZD7",
+    "B0BHXS3TJY",
+    "B0GFY55JMB",
+    "B0DX76DCH2",
+    "B08139SPB4",
+    "B0C4X1B71W",
+    "B08589MG8D"
+  ],
+  "json_file": "batch_22_20260415_083903.json.gz",
+  "compression": "gzip",
+  "is_compressed": true
+}

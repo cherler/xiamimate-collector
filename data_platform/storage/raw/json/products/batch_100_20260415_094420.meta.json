@@ -1,0 +1,22 @@
+{
+  "category": "products",
+  "label": "batch_100",
+  "saved_at": "2026-04-15 09:44:21",
+  "domain": 1,
+  "asin_count": 10,
+  "asins": [
+    "B0BQDV64SG",
+    "B0FPQ95TDC",
+    "B0DZ9F9H9P",
+    "B07795WNHQ",
+    "B0147JPOOQ",
+    "B0G7MGJWSN",
+    "B07PDNNFWH",
+    "B089667LHX",
+    "B0GMBL7FJ4",
+    "B0CHZ51F6C"
+  ],
+  "json_file": "batch_100_20260415_094420.json.gz",
+  "compression": "gzip",
+  "is_compressed": true
+}
