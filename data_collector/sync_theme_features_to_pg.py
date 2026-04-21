@@ -70,6 +70,7 @@ DEFAULT_LOCK_PATH = _resolve_configured_path(
 
 DEFAULT_RETENTION_DAYS = max(30, int(os.environ.get("THEME_FEATURE_RETENTION_DAYS", "180")))
 DEFAULT_OVERLAP_DAYS = max(7, int(os.environ.get("THEME_FEATURE_REFRESH_OVERLAP_DAYS", "35")))
+DEFAULT_DUCKDB_THREADS = max(1, int(os.environ.get("THEME_FEATURE_DUCKDB_THREADS", "4")))
 SERVING_LOOKBACK_DAYS = 7
 
 FEATURE_TABLES = {
@@ -365,7 +366,7 @@ def get_duckdb_conn(db_path: str | Path) -> duckdb.DuckDBPyConnection:
         logger.warning("打开 DuckDB 临时快照失败，将回退到源库只读连接: %s", exc)
         conn = duckdb.connect(str(src), read_only=True)
     conn.execute("SET preserve_insertion_order = false")
-    conn.execute("SET threads TO 1")
+    conn.execute(f"SET threads TO {DEFAULT_DUCKDB_THREADS}")
     conn.execute(f"SET temp_directory = '{tmp_dir.as_posix()}'")
     return conn
 
@@ -385,6 +386,46 @@ def _get_pg_max_date(pg_conn, pg_table: str):
         return row[0] if row and row[0] is not None else None
 
 
+def _compute_refresh_start(*, pg_conn, pg_table: str, retention_days: int, overlap_days: int, full: bool):
+    retention_start = _retention_start_date(retention_days)
+    if full:
+        return retention_start
+
+    max_date = _get_pg_max_date(pg_conn, pg_table)
+    if max_date is None:
+        return retention_start
+
+    return max(retention_start, max_date - timedelta(days=overlap_days))
+
+
+def _build_refresh_plan(
+    *,
+    pg_conn,
+    table_names: list[str],
+    retention_days: int,
+    overlap_days: int,
+    full: bool,
+) -> dict[str, object]:
+    refresh_starts: dict[str, object] = {}
+    for table_name in table_names:
+        refresh_starts[table_name] = _compute_refresh_start(
+            pg_conn=pg_conn,
+            pg_table=FEATURE_TABLES[table_name]["pg_table"],
+            retention_days=retention_days,
+            overlap_days=overlap_days,
+            full=full,
+        )
+
+    earliest_refresh_start = min(refresh_starts.values())
+    build_source_start = earliest_refresh_start - timedelta(days=SERVING_LOOKBACK_DAYS)
+    build_history_start = build_source_start
+    return {
+        "refresh_starts": refresh_starts,
+        "build_source_start": build_source_start,
+        "build_history_start": build_history_start,
+    }
+
+
 def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -392,18 +433,19 @@ def _sql_literal(value: str) -> str:
 def build_serving_feature_tables(
     duck: duckdb.DuckDBPyConnection,
     *,
-    retention_days: int,
+    build_source_start,
+    build_history_start,
 ) -> None:
-    retention_start = _retention_start_date(retention_days)
-    source_start = retention_start - timedelta(days=SERVING_LOOKBACK_DAYS)
-    history_start = source_start
-
-    logger.info("构建 DuckDB serving 基础特征临时表 (history_start=%s)", history_start)
+    logger.info(
+        "构建 DuckDB serving 基础特征临时表 (history_start=%s, source_start=%s)",
+        build_history_start,
+        build_source_start,
+    )
     duck.execute(
         "CREATE OR REPLACE TEMP TABLE theme_sync_base_daily AS "
         + THEME_BASE_SOURCE_SQL.format(
-            source_start_date=source_start.isoformat(),
-            history_start_date=history_start.isoformat(),
+            source_start_date=build_source_start.isoformat(),
+            history_start_date=build_history_start.isoformat(),
             domain_multiplier_case=_domain_multiplier_case(),
             coeff_a_case=_category_coeff_case("coeff_a"),
             coeff_b_case=_category_coeff_case("coeff_b"),
@@ -411,10 +453,10 @@ def build_serving_feature_tables(
     )
     logger.info("DuckDB serving 基础特征临时表构建完成")
 
-    logger.info("构建 DuckDB serving 趋势特征临时表 (source_start=%s)", source_start)
+    logger.info("构建 DuckDB serving 趋势特征临时表 (source_start=%s)", build_source_start)
     duck.execute(
         "CREATE OR REPLACE TEMP TABLE theme_sync_trends_daily AS "
-        + THEME_TRENDS_SOURCE_SQL.format(source_start_date=source_start.isoformat())
+        + THEME_TRENDS_SOURCE_SQL.format(source_start_date=build_source_start.isoformat())
     )
     logger.info("DuckDB serving 趋势特征临时表构建完成")
 
@@ -450,15 +492,13 @@ def sync_feature_table(
     config: dict,
     *,
     retention_days: int,
-    overlap_days: int,
     full: bool,
+    refresh_start,
 ) -> int:
     pg_table = config["pg_table"]
     source_table = config["source_table"]
     columns = config["columns"]
     retention_start = _retention_start_date(retention_days)
-    max_date = None if full else _get_pg_max_date(pg_conn, pg_table)
-    refresh_start = retention_start if max_date is None else max(retention_start, max_date - timedelta(days=overlap_days))
 
     logger.info(
         "同步 %s -> %s (refresh_start=%s, retention_start=%s, full=%s)",
@@ -547,7 +587,24 @@ def run_sync(
 
     try:
         ensure_pg_schema(pg_conn)
-        build_serving_feature_tables(duck, retention_days=retention_days)
+        refresh_plan = _build_refresh_plan(
+            pg_conn=pg_conn,
+            table_names=table_names,
+            retention_days=retention_days,
+            overlap_days=overlap_days,
+            full=full,
+        )
+        logger.info(
+            "DuckDB 临时特征表构建窗口 — history_start=%s source_start=%s duckdb_threads=%s",
+            refresh_plan["build_history_start"],
+            refresh_plan["build_source_start"],
+            DEFAULT_DUCKDB_THREADS,
+        )
+        build_serving_feature_tables(
+            duck,
+            build_source_start=refresh_plan["build_source_start"],
+            build_history_start=refresh_plan["build_history_start"],
+        )
         for table_name in table_names:
             try:
                 results[table_name] = sync_feature_table(
@@ -556,8 +613,8 @@ def run_sync(
                     table_name,
                     FEATURE_TABLES[table_name],
                     retention_days=retention_days,
-                    overlap_days=overlap_days,
                     full=full,
+                    refresh_start=refresh_plan["refresh_starts"][table_name],
                 )
             except Exception as exc:
                 logger.error("  同步 %s 失败: %s", table_name, exc)

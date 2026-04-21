@@ -5,6 +5,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/load_collector_env.sh
 source "$ROOT_DIR/scripts/load_collector_env.sh"
+TUNNEL_SCRIPT="$ROOT_DIR/scripts/manage_pg_ssh_tunnel.sh"
+RUN_ONCE_SCRIPT="$ROOT_DIR/scripts/run_pg_sync_once.sh"
 PYTHON_BIN="${XIAMIMATE_PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 SYNC_SCRIPT="$ROOT_DIR/data_collector/sync_duckdb_to_pg.py"
 LOG_DIR="${XIAMIMATE_LOG_DIR:-$ROOT_DIR/logs}"
@@ -15,6 +17,11 @@ INTERVAL="${SYNC_INTERVAL_SECONDS:-300}"
 DUCKDB_PATH="${PG_SYNC_DUCKDB_PATH:-${XIAMIMATE_DUCKDB_PATH:-${DUCKDB_PATH:-}}}"
 
 mkdir -p "$LOG_DIR"
+
+SYNC_TUNNEL_LOCAL_HOST="${PG_SYNC_TUNNEL_LOCAL_HOST:-${PG_TUNNEL_LOCAL_HOST:-127.0.0.1}}"
+SYNC_TUNNEL_LOCAL_PORT="${PG_SYNC_TUNNEL_LOCAL_PORT:-15432}"
+SYNC_TUNNEL_PID_FILE="${PG_SYNC_TUNNEL_PID_FILE:-$LOG_DIR/pg_sync_ssh_tunnel.pid}"
+SYNC_TUNNEL_LOG_FILE="${PG_SYNC_TUNNEL_LOG_FILE:-$LOG_DIR/pg_sync_ssh_tunnel.log}"
 
 cleanup_metadata() {
     rm -f "$PID_FILE" "$LOCK_FILE"
@@ -63,31 +70,77 @@ is_running() {
     resolve_pid >/dev/null 2>&1
 }
 
+tunnel_is_running() {
+    local pid
+    if [[ -f "$SYNC_TUNNEL_PID_FILE" ]]; then
+        pid="$(cat "$SYNC_TUNNEL_PID_FILE")"
+        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+print_pg_target() {
+    local host="${PG_HOST:-<unset>}"
+    local port="${PG_PORT:-5432}"
+    local db="${PG_DB:-<unset>}"
+    local user="${PG_USER:-<unset>}"
+
+    if collector_pg_tunnel_enabled; then
+        host="$SYNC_TUNNEL_LOCAL_HOST"
+        port="$SYNC_TUNNEL_LOCAL_PORT"
+        echo "pg_target=${host}:${port}/${db} as ${user} (ssh tunnel -> ${PG_TUNNEL_REMOTE_HOST:-<unset>}:${PG_TUNNEL_REMOTE_PORT:-<unset>} via ${PG_TUNNEL_SSH_HOST:-<unset>})"
+        echo "pg_target_mode=local"
+    else
+        echo "pg_target=${host}:${port}/${db} as ${user}"
+        echo "pg_target_mode=remote"
+    fi
+}
+
+print_pg_tunnel() {
+    if collector_pg_tunnel_enabled; then
+        echo "pg_tunnel=${SYNC_TUNNEL_LOCAL_HOST}:${SYNC_TUNNEL_LOCAL_PORT} via ${PG_TUNNEL_SSH_HOST:-<unset>} -> ${PG_TUNNEL_REMOTE_HOST:-<unset>}:${PG_TUNNEL_REMOTE_PORT:-<unset>}"
+        echo "pg_tunnel_pid_file=$SYNC_TUNNEL_PID_FILE"
+        echo "pg_tunnel_log_file=$SYNC_TUNNEL_LOG_FILE"
+        if tunnel_is_running; then
+            echo "pg_tunnel_status=running"
+        else
+            echo "pg_tunnel_status=stopped"
+        fi
+    else
+        echo "pg_tunnel=disabled"
+    fi
+}
+
 build_command() {
     local cmd=(
-        "$PYTHON_BIN"
-        "$SYNC_SCRIPT"
-        --loop
-        --interval "$INTERVAL"
-        --lock-file "$LOCK_FILE"
+        bash
+        "$RUN_ONCE_SCRIPT"
     )
-
-    if [[ -n "$DUCKDB_PATH" ]]; then
-        cmd+=(--duckdb-path "$DUCKDB_PATH")
-    fi
 
     printf '%q ' "${cmd[@]}"
 }
 
+build_loop_command() {
+    local once_command
+    once_command="$(build_command)"
+    printf 'while true; do %s; sleep %q; done' "$once_command" "$INTERVAL"
+}
+
 start_sync() {
+    collector_require_pg_env
+    collector_require_pg_tunnel_env
+
     if is_running; then
         echo "sync loop already running: PID $(resolve_pid)"
+        print_pg_target
+        print_pg_tunnel
         return 0
     fi
 
     cleanup_metadata
     local command
-    command="$(build_command)"
+    command="$(build_loop_command)"
     nohup zsh -lc "cd '$ROOT_DIR' && $command" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
@@ -100,6 +153,8 @@ start_sync() {
 
     echo "sync loop started: PID $(cat "$PID_FILE")"
     echo "log file: $LOG_FILE"
+    print_pg_target
+    print_pg_tunnel
 }
 
 stop_sync() {
@@ -112,10 +167,10 @@ stop_sync() {
     local pid
     pid="$(resolve_pid)"
 
-    kill "$pid" 2>/dev/null || true
+    kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     if ! wait_for_shutdown "$pid"; then
         echo "sync loop did not stop gracefully; forcing kill: PID $pid"
-        kill -9 "$pid" 2>/dev/null || true
+        kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
         if ! wait_for_shutdown "$pid" 25 0.2; then
             echo "failed to stop sync loop: PID $pid"
             return 1
@@ -130,6 +185,10 @@ status_sync() {
     if is_running; then
         echo "sync loop running: PID $(resolve_pid)"
         echo "log file: $LOG_FILE"
+        if collector_require_pg_env >/dev/null 2>&1; then
+            print_pg_target
+            print_pg_tunnel
+        fi
     else
         echo "sync loop is not running"
         return 1
@@ -150,11 +209,17 @@ show_logs() {
 }
 
 preview_sync() {
+    collector_require_pg_env
+
     echo "python_bin=$PYTHON_BIN"
     echo "log_dir=$LOG_DIR"
     echo "lock_file=$LOCK_FILE"
     echo "duckdb_path=${DUCKDB_PATH:-<default>}"
-    echo "command=$(build_command)"
+    echo "interval_seconds=$INTERVAL"
+    print_pg_target
+    print_pg_tunnel
+    echo "sync_once_command=$(build_command)"
+    echo "loop_command=$(build_loop_command)"
 }
 
 case "${1:-}" in

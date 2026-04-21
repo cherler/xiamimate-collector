@@ -35,22 +35,22 @@ Phase 2 已补齐：
 
 1. 复制 `data_collector/.env.example` 为本地 `data_collector/.env`。
 2. 至少填写以下路径变量：
-	- `XIAMIMATE_RUNTIME_ROOT`
-	- `XIAMIMATE_PYTHON_BIN`
-	- `XIAMIMATE_DUCKDB_PATH`
-	- `XIAMIMATE_RAW_PRODUCTS_DIR`
-	- `XIAMIMATE_LOG_DIR`
-	- `XIAMIMATE_INIT_SYNC_TABLES_SQL`
+   - `XIAMIMATE_RUNTIME_ROOT`
+   - `XIAMIMATE_PYTHON_BIN`
+   - `XIAMIMATE_DUCKDB_PATH`
+   - `XIAMIMATE_RAW_PRODUCTS_DIR`
+   - `XIAMIMATE_LOG_DIR`
+   - `XIAMIMATE_INIT_SYNC_TABLES_SQL`
 3. 如果当前目录结构仍是 `xiamimate-collector`、`xiamimate-runtime`、`xiamimate-data-infra` 同级，最少可以只填：
-	- `XIAMIMATE_RUNTIME_ROOT=/path/to/xiamimate-runtime`
+   - `XIAMIMATE_RUNTIME_ROOT=/path/to/xiamimate-runtime`
 4. 如果当前目录结构还包含同级 `xiamimate-data-infra`，建议同时填：
-	- `XIAMIMATE_DATA_INFRA_ROOT=/path/to/xiamimate-data-infra`
+   - `XIAMIMATE_DATA_INFRA_ROOT=/path/to/xiamimate-data-infra`
 5. 当前正式运行推荐分别指向：
-	- Python: `xiamimate-runtime/python/.venv/bin/python`
-	- DuckDB: `xiamimate-runtime/duckdb/warehouse/local_analytics.duckdb`
-	- raw products: `xiamimate-runtime/raw/json/products`
-	- logs: 本仓 `logs/`
-	- init sync SQL: `xiamimate-data-infra/postgres/init_sync_tables.sql`
+   - Python: `xiamimate-runtime/python/.venv/bin/python`
+   - DuckDB: `xiamimate-runtime/duckdb/warehouse/local_analytics.duckdb`
+   - raw products: `xiamimate-runtime/raw/json/products`
+   - logs: 本仓 `logs/`
+   - init sync SQL: `xiamimate-data-infra/postgres/init_sync_tables.sql`
 
 说明：`xiamimate-data-infra` 现在已经承接 `postgres/init_sync_tables.sql` 这份当前 PostgreSQL bootstrap DDL。collector phase 2 默认会优先使用 data-infra 里的这份 SQL，同时优先使用 `xiamimate-runtime` 的共享 Python / DuckDB / raw 路径。
 说明：当前不建议复制 `.venv` 目录。虚拟环境通常带有创建时的绝对路径，直接 copy 很容易失效；当前已验证的做法是把它整体迁到共享运行时根目录，并通过稳定路径引用。
@@ -67,3 +67,47 @@ Phase 2 已补齐：
 1. `bash scripts/manage_auto_collect.sh {install|start|stop|status|logs}`
 2. `bash scripts/manage_pg_sync.sh {start|stop|restart|status|logs}`
 3. `bash scripts/manage_theme_feature_sync.sh {start|stop|restart|status|logs}`
+
+RDS cutover 说明：
+
+1. DuckDB 仍然是离线采集主库，迁移的是下游 PostgreSQL 镜像目标，不是把采集写入口改成 PostgreSQL。
+2. 从“本地 DuckDB -> 本地 PostgreSQL”切到“ECS DuckDB -> RDS PostgreSQL”时，先停掉本地旧 writer，再启 ECS writer，避免双写：
+   - `bash scripts/manage_pg_sync.sh stop`
+   - `bash scripts/manage_theme_feature_sync.sh stop`
+3. 在 ECS 的 `data_collector/.env` 中显式填写 `PG_HOST`、`PG_PORT`、`PG_DB`、`PG_USER`、`PG_PASSWORD` 指向 RDS；现在 `preview` / `status` 会直接打印 `pg_target=...`，启动前先核对目标库。
+4. `bash scripts/manage_pg_sync.sh preview` 与 `bash scripts/manage_theme_feature_sync.sh preview` 现在会在目标库配置缺失时直接失败，避免脚本静默回落到 Python 默认的 `localhost`。
+
+SSH 隧道同步模式：
+
+1. 如果本地开发机不能直连 RDS，但可以 SSH 到 ECS，可在 `data_collector/.env` 中启用 `PG_TUNNEL_ENABLED=1`。
+2. 建议保留 `PG_HOST` / `PG_PORT` 为真实 RDS 地址，再额外填写：
+   - `PG_TUNNEL_SSH_HOST=your-ssh-host`
+   - `PG_TUNNEL_LOCAL_HOST=127.0.0.1`
+   - `PG_TUNNEL_REMOTE_HOST=your-instance.pg.rds.aliyuncs.com`
+   - `PG_TUNNEL_REMOTE_PORT=5432`
+3. 如果两个循环任务都启用 SSH 隧道，建议分别使用不同的本地转发端口：
+   - `PG_SYNC_TUNNEL_LOCAL_PORT=15432`
+   - `THEME_FEATURE_SYNC_TUNNEL_LOCAL_PORT=15433`
+4. 启用后，两个循环任务会在每一轮真正执行同步前启动各自的 SSH 隧道，本轮同步结束后关闭隧道，而不是整条循环进程生命周期一直保持隧道常驻。
+5. 因为 `pg sync` 与 `theme feature sync` 使用各自的本地端口、PID 文件和日志文件，所以两个循环可以并行运行，不会争抢同一条 SSH 隧道。
+6. 共享隧道也可以单独管理：
+   - `bash scripts/manage_pg_ssh_tunnel.sh preview`
+   - `bash scripts/manage_pg_ssh_tunnel.sh status`
+   - `bash scripts/manage_pg_ssh_tunnel.sh start`
+   - `bash scripts/manage_pg_ssh_tunnel.sh stop`
+7. 当前 `manage_pg_sync.sh preview` / `manage_theme_feature_sync.sh preview` 会打印“单次同步命令”和“循环命令”，方便确认是否已经切到“按轮次开关隧道”的运行模式。
+
+PG sync 性能说明：
+
+1. 当前 `sync_duckdb_to_pg.py` 的主要瓶颈通常不是 `keepa_product_history` 小增量，而是两个聚合表：
+   - `sync.keepa_history_domain_daily`
+   - `sync.keepa_history_root_category_daily`
+2. 这两个表当前按 `PG_AGG_REFRESH_INTERVAL_SECONDS` 控制最小重刷间隔，默认 `3600` 秒；在间隔未到时，日志会显示 `skipped (refresh interval ... not reached)`，这是预期行为，不是异常。
+3. PostgreSQL 批量写入页大小由 `PG_SYNC_BATCH_SIZE` 控制，默认 `2000`；如果本地机器和 RDS 链路稳定、单批数据量大，可以继续调高测试。
+4. DuckDB 结果读取批次由 `PG_SYNC_FETCH_BATCH_SIZE` 控制，默认 `10000`；它决定 `sync_duckdb_to_pg.py` 每次从 DuckDB 拉多少行进入内存，再拆成 `PG_SYNC_BATCH_SIZE` 小批写入 PostgreSQL。通常应保持 `PG_SYNC_FETCH_BATCH_SIZE >= PG_SYNC_BATCH_SIZE`。
+
+Theme feature sync 性能说明：
+
+1. `THEME_FEATURE_REFRESH_OVERLAP_DAYS` 控制 PostgreSQL 增量回补窗口；如果任务是每天跑一次，通常不需要保留到 `35` 天这么大，先降到 `7` 或 `14` 更合理。
+2. `THEME_FEATURE_DUCKDB_THREADS` 控制 `sync_theme_features_to_pg.py` 在 DuckDB 内部构建临时特征表时使用的线程数，默认 `4`；如果本地机器负载高，可以降到 `2` 或 `1`。
+3. 当前 `sync_theme_features_to_pg.py` 会按“本轮最早 refresh_start + 7 天 lookback”构建 DuckDB 临时特征表，而不是再按整段 retention 窗口构建，从而减少临时表规模与本地内存/磁盘压力。

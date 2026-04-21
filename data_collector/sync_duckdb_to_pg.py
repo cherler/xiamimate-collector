@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import logging
 import os
 import shutil
@@ -75,7 +76,19 @@ DEFAULT_LOCK_PATH = _resolve_configured_path(
     "XIAMIMATE_LOG_DIR",
     PROJECT_ROOT / "logs",
 ) / "sync_duckdb_to_pg.lock"
+DEFAULT_SYNC_STATE_PATH = _resolve_configured_path(
+    "XIAMIMATE_LOG_DIR",
+    PROJECT_ROOT / "logs",
+) / "sync_duckdb_to_pg.state.json"
 PG_HISTORY_RETENTION_DAYS = 90
+PG_SYNC_BATCH_SIZE = max(200, int(os.environ.get("PG_SYNC_BATCH_SIZE", "2000")))
+PG_SYNC_FETCH_BATCH_SIZE = max(
+    PG_SYNC_BATCH_SIZE,
+    int(os.environ.get("PG_SYNC_FETCH_BATCH_SIZE", "10000")),
+)
+PG_AGG_REFRESH_INTERVAL_SECONDS = max(
+    300, int(os.environ.get("PG_AGG_REFRESH_INTERVAL_SECONDS", "3600"))
+)
 
 HISTORY_DOMAIN_DAILY_SQL = f"""
 SELECT
@@ -102,7 +115,10 @@ SELECT
     h.date,
     h.domain,
     COALESCE(r.root_category_id, r.category_id, 0) AS root_category_id,
-    COALESCE(c.category_cn, c.category_en, r.category, 'Unknown') AS root_category_name,
+    CASE
+        WHEN COALESCE(r.root_category_id, r.category_id, 0) = 0 THEN 'Unknown'
+        ELSE MAX(COALESCE(c.category_cn, c.category_en, r.category, 'Unknown'))
+    END AS root_category_name,
     COUNT(*) AS rows_count,
     COUNT(DISTINCT h.asin) AS asin_count,
     AVG(COALESCE(h.buy_box_price, h.amazon_price, h.new_price)) AS avg_effective_price,
@@ -120,7 +136,7 @@ LEFT JOIN curated.keepa_asin_registry r
     ON h.asin = r.asin AND h.domain = r.domain
 LEFT JOIN curated.keepa_category_registry c
     ON COALESCE(r.root_category_id, r.category_id) = c.category_id AND h.domain = c.domain
-GROUP BY 1, 2, 3, 4
+GROUP BY 1, 2, 3
 """
 
 # DuckDB 表 → PG 表映射 + 主键列
@@ -151,6 +167,7 @@ SYNC_TABLES = {
         "timestamp_col": "aggregated_at",
         "duck_sql": HISTORY_DOMAIN_DAILY_SQL,
         "always_full_refresh": True,
+        "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
     },
     "agg.keepa_history_root_category_daily": {
         "pg_table": "sync.keepa_history_root_category_daily",
@@ -158,6 +175,7 @@ SYNC_TABLES = {
         "timestamp_col": "aggregated_at",
         "duck_sql": HISTORY_ROOT_CATEGORY_DAILY_SQL,
         "always_full_refresh": True,
+        "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
     },
     "curated.google_trends_daily": {
         "pg_table": "sync.google_trends_daily",
@@ -317,6 +335,104 @@ def _apply_pg_retention(pg_conn, pg_table: str, retention_column: str, retention
         )
 
 
+def _load_sync_state(state_path: str | Path) -> dict:
+    path = Path(state_path)
+    if not path.exists():
+        return {}
+
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("读取同步状态文件失败，将忽略旧状态: %s", exc)
+        return {}
+
+
+def _save_sync_state(state_path: str | Path, state: dict) -> None:
+    path = Path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(state, ensure_ascii=True, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _should_skip_table(config: dict, full: bool, sync_state: dict) -> bool:
+    if full:
+        return False
+
+    min_sync_interval_seconds = int(config.get("min_sync_interval_seconds", 0) or 0)
+    if min_sync_interval_seconds <= 0:
+        return False
+
+    last_synced_at = sync_state.get(config["pg_table"])
+    if not last_synced_at:
+        return False
+
+    try:
+        last_synced_dt = datetime.fromisoformat(last_synced_at)
+    except ValueError:
+        return False
+
+    now = datetime.now(timezone.utc)
+    return (now - last_synced_dt).total_seconds() < min_sync_interval_seconds
+
+
+def _deduplicate_rows_by_pk(rows: list[tuple], columns: list[str], pk: list[str]) -> tuple[list[tuple], int]:
+    if not pk or not rows:
+        return rows, 0
+
+    pk_indexes = [columns.index(column) for column in pk]
+    deduplicated: dict[tuple, tuple] = {}
+    for row in rows:
+        key = tuple(row[index] for index in pk_indexes)
+        deduplicated[key] = row
+
+    duplicate_count = len(rows) - len(deduplicated)
+    if duplicate_count <= 0:
+        return rows, 0
+
+    return list(deduplicated.values()), duplicate_count
+
+
+def _detect_datetime_indexes(rows: list[tuple]) -> list[int]:
+    if not rows:
+        return []
+
+    datetime_indexes = []
+    for index in range(len(rows[0])):
+        for row in rows:
+            value = row[index]
+            if value is None:
+                continue
+            if isinstance(value, datetime):
+                datetime_indexes.append(index)
+            break
+    return datetime_indexes
+
+
+def _normalize_batch_rows(
+    rows: list[tuple],
+    ts_indexes: list[int],
+    keep_indexes: list[int] | None,
+) -> list[tuple]:
+    if not rows:
+        return []
+
+    if not ts_indexes and keep_indexes is None:
+        return rows
+
+    cst_offset = timedelta(hours=8)
+    normalized_rows = []
+    for raw_row in rows:
+        row = list(raw_row)
+        for idx in ts_indexes:
+            if row[idx] is not None:
+                row[idx] = row[idx] - cst_offset
+        if keep_indexes is not None:
+            row = [row[idx] for idx in keep_indexes]
+        normalized_rows.append(tuple(row))
+    return normalized_rows
+
+
 def sync_table(
     duck: duckdb.DuckDBPyConnection,
     pg_conn,
@@ -325,6 +441,7 @@ def sync_table(
     full: bool = False,
 ) -> int:
     """同步单张表, 返回写入行数."""
+    started_at = time.time()
     pg_table = config["pg_table"]
     pk = config["pk"]
     ts_col = config["timestamp_col"]
@@ -354,36 +471,24 @@ def sync_table(
 
     try:
         result = duck.execute(query)
-        columns = [desc[0] for desc in result.description]
-        rows = result.fetchall()
+        source_columns = [desc[0] for desc in result.description]
+        first_batch = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
     except Exception as e:
         logger.warning(f"读取 {duck_table} 失败: {e}")
         return 0
 
-    if not rows:
+    if not first_batch:
         logger.info(f"  {duck_table} → 无新数据")
         return 0
-
-    # DuckDB 存储的 TIMESTAMP 是 CST 本地时间 (无时区), 转为 UTC (-8h)
-    _CST_OFFSET = timedelta(hours=8)
-    ts_indices = [i for i, c in enumerate(columns)
-                  if rows and isinstance(rows[0][i], datetime)]
-    if ts_indices:
-        new_rows = []
-        for row in rows:
-            row = list(row)
-            for idx in ts_indices:
-                if row[idx] is not None:
-                    row[idx] = row[idx] - _CST_OFFSET
-            new_rows.append(tuple(row))
-        rows = new_rows
 
     # 跳过 PG 自增列
     skip = set(config.get("skip_columns", []))
     if skip:
-        keep_idx = [i for i, c in enumerate(columns) if c not in skip]
-        columns = [columns[i] for i in keep_idx]
-        rows = [tuple(row[i] for i in keep_idx) for row in rows]
+        keep_idx = [i for i, c in enumerate(source_columns) if c not in skip]
+        columns = [source_columns[i] for i in keep_idx]
+    else:
+        keep_idx = None
+        columns = source_columns
 
     # 使用 UPSERT (INSERT ON CONFLICT) 或普通 INSERT
     col_list = ", ".join(columns)
@@ -406,6 +511,10 @@ def sync_table(
     else:
         sql = f"INSERT INTO {pg_table} ({col_list}) VALUES ({placeholders})"
 
+    total_rows = 0
+    fetch_batch_count = 0
+    dropped_duplicate_rows = 0
+
     with pg_conn.cursor() as cur:
         retention_days = config.get("retention_days")
         retention_column = config.get("retention_column")
@@ -423,18 +532,51 @@ def sync_table(
                 cur.execute(
                     f"DELETE FROM {pg_table} WHERE {ts_col} >= %s", [max_ts]
                 )
-        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+
+        raw_rows = first_batch
+        while raw_rows:
+            fetch_batch_count += 1
+            ts_indexes = _detect_datetime_indexes(raw_rows)
+            rows = _normalize_batch_rows(raw_rows, ts_indexes, keep_idx)
+            rows, duplicate_count = _deduplicate_rows_by_pk(rows, columns, pk)
+            dropped_duplicate_rows += duplicate_count
+            if duplicate_count > 0:
+                logger.warning(
+                    "  %s → %s: dropped %s duplicate rows for PK %s before batch upsert",
+                    duck_table,
+                    pg_table,
+                    duplicate_count,
+                    ", ".join(pk),
+                )
+
+            if rows:
+                psycopg2.extras.execute_values(
+                    cur,
+                    sql.replace(f"VALUES ({placeholders})", "VALUES %s"),
+                    rows,
+                    page_size=PG_SYNC_BATCH_SIZE,
+                )
+                total_rows += len(rows)
+
+            raw_rows = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
 
     pg_conn.commit()
-    logger.info(f"  {duck_table} → {pg_table}: {len(rows)} rows")
-    return len(rows)
+    elapsed = round(time.time() - started_at, 1)
+    duplicate_suffix = ""
+    if dropped_duplicate_rows > 0:
+        duplicate_suffix = f", dropped {dropped_duplicate_rows} duplicate rows"
+    logger.info(
+        f"  {duck_table} → {pg_table}: {total_rows} rows in {elapsed}s across {fetch_batch_count} fetch batches{duplicate_suffix}"
+    )
+    return total_rows
 
 
-def run_sync(duckdb_path: str | Path, full: bool = False) -> dict:
+def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path = DEFAULT_SYNC_STATE_PATH) -> dict:
     """执行一轮同步."""
     logger.info(f"{'全量' if full else '增量'}同步开始 — DuckDB: {duckdb_path}")
     start = time.time()
     results = {}
+    sync_state = _load_sync_state(state_path)
 
     duck = get_duckdb_conn(duckdb_path)
     pg_conn = get_pg_conn()
@@ -443,8 +585,20 @@ def run_sync(duckdb_path: str | Path, full: bool = False) -> dict:
         ensure_pg_sync_schema(pg_conn)
         for duck_table, config in SYNC_TABLES.items():
             try:
+                if _should_skip_table(config, full=full, sync_state=sync_state):
+                    interval_seconds = int(config.get("min_sync_interval_seconds", 0) or 0)
+                    logger.info(
+                        "  %s → %s: skipped (refresh interval %ss not reached)",
+                        duck_table,
+                        config["pg_table"],
+                        interval_seconds,
+                    )
+                    results[duck_table] = 0
+                    continue
+
                 count = sync_table(duck, pg_conn, duck_table, config, full=full)
                 results[duck_table] = count
+                sync_state[config["pg_table"]] = datetime.now(timezone.utc).isoformat()
             except Exception as e:
                 logger.error(f"  同步 {duck_table} 失败: {e}")
                 pg_conn.rollback()
@@ -452,6 +606,8 @@ def run_sync(duckdb_path: str | Path, full: bool = False) -> dict:
     finally:
         duck.close()
         pg_conn.close()
+
+    _save_sync_state(state_path, sync_state)
 
     elapsed = round(time.time() - start, 1)
     total = sum(v for v in results.values() if v > 0)
