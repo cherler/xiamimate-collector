@@ -25,6 +25,7 @@ import csv
 import gzip
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -1303,7 +1304,20 @@ class AutoCollector:
 # Raw response saving
 # ---------------------------------------------------------------------------
 
-_RAW_DIR = Path(__file__).resolve().parents[2] / "data_platform" / "storage" / "raw" / "json"
+
+def _resolve_raw_dir() -> Path:
+    raw_json_root = os.environ.get("XIAMIMATE_RAW_JSON_ROOT")
+    if raw_json_root:
+        return Path(raw_json_root).expanduser().resolve()
+
+    products_dir = os.environ.get("XIAMIMATE_RAW_PRODUCTS_DIR")
+    if products_dir:
+        return Path(products_dir).expanduser().resolve().parent
+
+    return (Path(__file__).resolve().parents[2] / "data_platform" / "storage" / "raw" / "json").resolve()
+
+
+_RAW_DIR = _resolve_raw_dir()
 
 
 def _save_raw_response(

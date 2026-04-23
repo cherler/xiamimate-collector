@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/load_collector_env.sh
 source "$ROOT_DIR/scripts/load_collector_env.sh"
@@ -12,7 +14,61 @@ LOCK_FILE="$LOG_DIR/auto_collect.lock"
 LOG_FILE="$LOG_DIR/auto_collect.log"
 
 PLIST_NAME="com.xiamimate.auto-collect"
-PLIST_SRC="$ROOT_DIR/scripts/${PLIST_NAME}.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
+
+DOMAIN="${AUTO_COLLECT_DOMAIN:-all}"
+INTERVAL_MINUTES="${AUTO_COLLECT_INTERVAL_MINUTES:-3}"
+BATCH_SIZE="${AUTO_COLLECT_BATCH_SIZE:-50}"
+STALE_HOURS="${AUTO_COLLECT_STALE_HOURS:-336}"
+ENABLE_TRENDS="${AUTO_COLLECT_ENABLE_TRENDS:-true}"
+ENABLE_STRATEGY_EXPANSION="${AUTO_COLLECT_ENABLE_STRATEGY_EXPANSION:-true}"
+STRATEGY_PENDING_THRESHOLD="${AUTO_COLLECT_STRATEGY_PENDING_THRESHOLD:-200}"
+STRATEGY_CATEGORY_LIMIT="${AUTO_COLLECT_STRATEGY_CATEGORY_LIMIT:-2}"
+STRATEGY_KEYWORD_LIMIT="${AUTO_COLLECT_STRATEGY_KEYWORD_LIMIT:-5}"
+STRATEGY_CATEGORY_COOLDOWN_HOURS="${AUTO_COLLECT_STRATEGY_CATEGORY_COOLDOWN_HOURS:-720}"
+STRATEGY_KEYWORD_COOLDOWN_HOURS="${AUTO_COLLECT_STRATEGY_KEYWORD_COOLDOWN_HOURS:-72}"
+DB_PATH="${AUTO_COLLECT_DB_PATH:-${XIAMIMATE_DUCKDB_PATH:-${DUCKDB_PATH:-}}}"
+EXTRA_ARGS="${AUTO_COLLECT_EXTRA_ARGS:-}"
+
+mkdir -p "$LOG_DIR"
+
+cleanup_metadata() {
+    rm -f "$PID_FILE" "$LOCK_FILE"
+}
+
+wait_for_shutdown() {
+    local pid="$1"
+    local attempts="${2:-50}"
+    local interval_seconds="${3:-0.2}"
+    local attempt=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( attempt >= attempts )); then
+            return 1
+        fi
+        sleep "$interval_seconds"
+        attempt=$((attempt + 1))
+    done
+
+    return 0
+}
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/load_collector_env.sh
+source "$ROOT_DIR/scripts/load_collector_env.sh"
+
+PYTHON_BIN="${XIAMIMATE_PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
+LOG_DIR="${XIAMIMATE_LOG_DIR:-$ROOT_DIR/logs}"
+PID_FILE="$LOG_DIR/auto_collect.pid"
+LOCK_FILE="$LOG_DIR/auto_collect.lock"
+LOG_FILE="$LOG_DIR/auto_collect.log"
+
+PLIST_NAME="com.xiamimate.auto-collect"
 PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
 
 DOMAIN="${AUTO_COLLECT_DOMAIN:-all}"
@@ -174,7 +230,7 @@ start_auto_collect() {
     local command
     command="$(build_command)"
     nohup env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-        zsh -lc "cd '$ROOT_DIR' && $command" >> "$LOG_FILE" 2>&1 &
+        /bin/zsh -lc "cd '$ROOT_DIR' && $command" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     sleep 1
@@ -256,41 +312,84 @@ preview_auto_collect() {
     echo "log_dir=$LOG_DIR"
     echo "lock_file=$LOCK_FILE"
     echo "duckdb_path=${DB_PATH:-<default>}"
+    echo "plist_name=$PLIST_NAME"
+    echo "plist_dst=$PLIST_DST"
     echo "command=$(build_command)"
 }
-
-# ------------------------------------------------------------------
-# launchd 管理 (推荐: 休眠恢复 + 崩溃自动重启)
-# ------------------------------------------------------------------
 
 is_launchd_loaded() {
     launchctl list "$PLIST_NAME" >/dev/null 2>&1
 }
 
-install_launchd() {
-    if [[ ! -f "$PLIST_SRC" ]]; then
-        echo "plist not found: $PLIST_SRC"
-        return 1
-    fi
+launchd_pid() {
+    launchctl list "$PLIST_NAME" 2>/dev/null | sed -n 's/.*"PID" = \([0-9][0-9]*\);/\1/p' | head -n 1
+}
 
-    # 先停掉旧的 nohup 进程 (如果有)
-    if is_running; then
+write_launchd_plist() {
+    local command
+    command="$(build_command)"
+
+    cat > "$PLIST_DST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_NAME}</string>
+
+    <key>WorkingDirectory</key>
+    <string>${ROOT_DIR}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>cd '${ROOT_DIR}' &amp;&amp; env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY ${command}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>${ROOT_DIR}</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_FILE}</string>
+
+    <key>AbandonProcessGroup</key>
+    <false/>
+</dict>
+</plist>
+EOF
+}
+
+install_launchd() {
+    if is_running && ! is_launchd_loaded; then
         echo "stopping existing nohup process first..."
         stop_auto_collect || true
     fi
 
-    # 卸载旧 plist (如果已加载)
     if is_launchd_loaded; then
         launchctl unload "$PLIST_DST" 2>/dev/null || true
     fi
 
-    cp "$PLIST_SRC" "$PLIST_DST"
+    write_launchd_plist
     launchctl load "$PLIST_DST"
 
     sleep 2
     if is_launchd_loaded; then
         local pid
-        pid="$(launchctl list "$PLIST_NAME" 2>/dev/null | awk 'NR==2{print $1}')"
+        pid="$(launchd_pid)"
         echo "launchd 已安装并启动: $PLIST_NAME (PID ${pid:-pending})"
         echo "  开机自启: YES"
         echo "  崩溃重启: YES"
@@ -303,7 +402,7 @@ install_launchd() {
         echo "  启动: bash scripts/manage_auto_collect.sh start"
         echo "  卸载: bash scripts/manage_auto_collect.sh uninstall"
     else
-        echo "launchd 安装失败; check: launchctl list | grep xiamimate"
+        echo "launchd 安装失败; check: launchctl list | grep ${PLIST_NAME}"
         return 1
     fi
 }

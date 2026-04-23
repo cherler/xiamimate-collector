@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import sys
 
@@ -8,7 +9,11 @@ from dotenv import load_dotenv
 
 from .dataset_builder import SalesForecastDatasetBuilder
 from .feature_matrix import FeatureMatrixBuilder
-from .week1_feature_foundation import Week1FeatureFoundationBuilder
+from .week1_feature_foundation import (
+    Week1FeatureFoundationBuilder,
+    build_domain_output_dir,
+    discover_available_domains,
+)
 
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -23,6 +28,39 @@ def main() -> None:
         return
 
     args.handler(args)
+
+
+def _parse_domains(raw_domains: str | None) -> list[int]:
+    if not raw_domains:
+        return []
+    domains: list[int] = []
+    for item in raw_domains.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        domains.append(int(stripped))
+    return domains
+
+
+def _build_week1_domain_job(
+    *,
+    source_db_path: Path | None,
+    output_dir: Path | None,
+    domain: int,
+    active_only: bool,
+    duckdb_threads: int | None,
+    feature_profile: str,
+) -> tuple[int, dict[str, str]]:
+    builder = Week1FeatureFoundationBuilder(
+        source_db_path=source_db_path,
+        output_dir=build_domain_output_dir(output_dir, domain),
+        domain=domain,
+        active_only=active_only,
+        duckdb_threads=duckdb_threads,
+        feature_profile=feature_profile,
+    )
+    outputs = builder.build()
+    return domain, {name: str(path) for name, path in outputs.items()}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,7 +106,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出目录，默认 data_platform/storage/features/training_sets/week1_foundation",
     )
     foundation.add_argument("--domain", type=int, default=None, help="仅构建指定站点")
+    foundation.add_argument(
+        "--domains",
+        default=None,
+        help="逗号分隔多个站点；指定后会按站点分别构建并落地到子目录",
+    )
+    foundation.add_argument(
+        "--split-by-domain",
+        action="store_true",
+        help="自动发现源库中的站点，并按站点分别构建落地",
+    )
     foundation.add_argument("--active-only", action="store_true", help="仅构建当前活跃 ASIN")
+    foundation.add_argument(
+        "--duckdb-threads",
+        type=int,
+        default=None,
+        help="每个构建进程内部 DuckDB 线程数；默认读取 WEEK1_FOUNDATION_DUCKDB_THREADS",
+    )
+    foundation.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="按域并行构建的最大进程数；仅在 --domains/--split-by-domain 下生效",
+    )
+    foundation.add_argument(
+        "--feature-profile",
+        choices=["full", "base"],
+        default="full",
+        help="full=基础+趋势+交叉+训练集，base=仅基础时序特征，跳过重的趋势/交叉阶段",
+    )
     foundation.set_defaults(handler=handle_build_week1_foundation)
 
     return parser
@@ -120,11 +186,74 @@ def handle_build_feature_matrix(args: argparse.Namespace) -> None:
 
 
 def handle_build_week1_foundation(args: argparse.Namespace) -> None:
+    if args.domain is not None and args.domains:
+        raise SystemExit("--domain 与 --domains 不能同时使用")
+
+    explicit_domains = _parse_domains(args.domains)
+    source_db_path = Path(args.source_db) if args.source_db else None
+    output_dir = Path(args.output_dir) if args.output_dir else None
+
+    target_domains: list[int] = []
+    if args.domain is not None:
+        target_domains = [args.domain]
+    elif explicit_domains:
+        target_domains = explicit_domains
+    elif args.split_by_domain:
+        target_domains = discover_available_domains(
+            source_db_path,
+            active_only=args.active_only,
+        )
+
+    if target_domains:
+        max_workers = max(1, args.max_workers)
+        print(
+            "Building week1 feature foundation per domain: "
+            f"{target_domains} (max_workers={min(max_workers, len(target_domains))}, "
+            f"duckdb_threads={args.duckdb_threads or 'env/default'}, feature_profile={args.feature_profile})"
+        )
+
+        if max_workers == 1 or len(target_domains) == 1:
+            for domain in target_domains:
+                built_domain, outputs = _build_week1_domain_job(
+                    source_db_path=source_db_path,
+                    output_dir=output_dir,
+                    domain=domain,
+                    active_only=args.active_only,
+                    duckdb_threads=args.duckdb_threads,
+                    feature_profile=args.feature_profile,
+                )
+                print(f"Domain {built_domain} outputs:")
+                for name, path in outputs.items():
+                    print(f"- {name}: {path}")
+            return
+
+        with ProcessPoolExecutor(max_workers=min(max_workers, len(target_domains))) as executor:
+            future_map = {
+                executor.submit(
+                    _build_week1_domain_job,
+                    source_db_path=source_db_path,
+                    output_dir=output_dir,
+                    domain=domain,
+                    active_only=args.active_only,
+                    duckdb_threads=args.duckdb_threads,
+                    feature_profile=args.feature_profile,
+                ): domain
+                for domain in target_domains
+            }
+            for future in as_completed(future_map):
+                built_domain, outputs = future.result()
+                print(f"Domain {built_domain} outputs:")
+                for name, path in outputs.items():
+                    print(f"- {name}: {path}")
+        return
+
     builder = Week1FeatureFoundationBuilder(
-        source_db_path=Path(args.source_db) if args.source_db else None,
-        output_dir=Path(args.output_dir) if args.output_dir else None,
+        source_db_path=source_db_path,
+        output_dir=output_dir,
         domain=args.domain,
         active_only=args.active_only,
+        duckdb_threads=args.duckdb_threads,
+        feature_profile=args.feature_profile,
     )
     outputs = builder.build()
 

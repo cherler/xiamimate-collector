@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/load_collector_env.sh
 source "$ROOT_DIR/scripts/load_collector_env.sh"
@@ -25,7 +27,7 @@ is_running() {
 
 build_command() {
     local cmd=(
-        ssh
+        /usr/bin/ssh
         -o ExitOnForwardFailure=yes
         -o ServerAliveInterval=30
         -o ServerAliveCountMax=3

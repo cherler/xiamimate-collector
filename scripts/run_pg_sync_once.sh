@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/load_collector_env.sh
 source "$ROOT_DIR/scripts/load_collector_env.sh"
@@ -21,7 +23,7 @@ cleanup_tunnel() {
         PG_TUNNEL_LOCAL_PORT="$PG_SYNC_TUNNEL_LOCAL_PORT_VALUE" \
         PG_TUNNEL_PID_FILE="$PG_SYNC_TUNNEL_PID_FILE_VALUE" \
         PG_TUNNEL_LOG_FILE="$PG_SYNC_TUNNEL_LOG_FILE_VALUE" \
-        bash "$TUNNEL_SCRIPT" stop >/dev/null 2>&1 || true
+        /bin/bash "$TUNNEL_SCRIPT" stop >/dev/null 2>&1 || true
     fi
 }
 
@@ -40,7 +42,7 @@ if collector_pg_tunnel_enabled; then
     PG_TUNNEL_LOCAL_PORT="$PG_SYNC_TUNNEL_LOCAL_PORT_VALUE" \
     PG_TUNNEL_PID_FILE="$PG_SYNC_TUNNEL_PID_FILE_VALUE" \
     PG_TUNNEL_LOG_FILE="$PG_SYNC_TUNNEL_LOG_FILE_VALUE" \
-    bash "$TUNNEL_SCRIPT" start
+    /bin/bash "$TUNNEL_SCRIPT" start
 
     export PG_HOST="$PG_SYNC_TUNNEL_LOCAL_HOST_VALUE"
     export PG_PORT="$PG_SYNC_TUNNEL_LOCAL_PORT_VALUE"

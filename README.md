@@ -14,7 +14,7 @@
 - `doc/`
 - `scripts/manage_auto_collect.sh`
 - `scripts/manage_pg_sync.sh`
-- `scripts/manage_theme_feature_sync.sh`
+- `scripts/manage_theme_sync.sh`
 - `scripts/cleanup_raw_products.sh`
 - `scripts/normalize_product_recall_query.py`
 
@@ -60,22 +60,44 @@ Phase 2 已补齐：
 1. `bash scripts/dry_run_validate_collector.sh`
 2. `bash scripts/manage_auto_collect.sh preview`
 3. `bash scripts/manage_pg_sync.sh preview`
-4. `bash scripts/manage_theme_feature_sync.sh preview`
+4. `bash scripts/manage_theme_sync.sh preview`
 
 当前正式运行入口：
 
 1. `bash scripts/manage_auto_collect.sh {install|start|stop|status|logs}`
-2. `bash scripts/manage_pg_sync.sh {start|stop|restart|status|logs}`
-3. `bash scripts/manage_theme_feature_sync.sh {start|stop|restart|status|logs}`
+2. `bash scripts/manage_pg_sync.sh {install|start|stop|restart|status|uninstall|logs}`
+3. `bash scripts/manage_theme_sync.sh {install|start|stop|restart|status|uninstall|logs}`
+
+统一管理入口：
+
+1. 推荐优先使用 `bash scripts/manage_collector_jobs.sh help`
+2. 查看所有任务状态：`bash scripts/manage_collector_jobs.sh status`
+3. 预览所有任务命令：`bash scripts/manage_collector_jobs.sh preview`
+4. 按任务转发：
+   - `bash scripts/manage_collector_jobs.sh auto status`
+   - `bash scripts/manage_collector_jobs.sh pg-sync preview`
+   - `bash scripts/manage_collector_jobs.sh theme-sync logs`
+   - `bash scripts/manage_collector_jobs.sh pg-tunnel status`
+   - `bash scripts/manage_collector_jobs.sh week1 preview`
+
+脚本职责边界：
+
+1. `manage_pg_sync.sh` 是“DuckDB -> PostgreSQL 主同步循环”，同步规范化表和聚合表。
+2. `manage_theme_sync.sh` 是“DuckDB -> PostgreSQL 主题特征同步循环”，同步在线 serving 用的主题特征子集（base/trends/cross）。
+3. `manage_pg_ssh_tunnel.sh` 只负责 SSH 隧道，不做任何数据同步。
+4. `manage_pg_sync.sh` 和 `manage_theme_sync.sh` 是否写本地 PostgreSQL、直连 RDS、还是通过 SSH 隧道写 RDS，不由脚本名决定，而由 `data_collector/.env` 里的 `PG_*` / `PG_TUNNEL_*` 配置决定。
 
 RDS cutover 说明：
 
 1. DuckDB 仍然是离线采集主库，迁移的是下游 PostgreSQL 镜像目标，不是把采集写入口改成 PostgreSQL。
 2. 从“本地 DuckDB -> 本地 PostgreSQL”切到“ECS DuckDB -> RDS PostgreSQL”时，先停掉本地旧 writer，再启 ECS writer，避免双写：
    - `bash scripts/manage_pg_sync.sh stop`
-   - `bash scripts/manage_theme_feature_sync.sh stop`
+   - `bash scripts/manage_theme_sync.sh stop`
 3. 在 ECS 的 `data_collector/.env` 中显式填写 `PG_HOST`、`PG_PORT`、`PG_DB`、`PG_USER`、`PG_PASSWORD` 指向 RDS；现在 `preview` / `status` 会直接打印 `pg_target=...`，启动前先核对目标库。
-4. `bash scripts/manage_pg_sync.sh preview` 与 `bash scripts/manage_theme_feature_sync.sh preview` 现在会在目标库配置缺失时直接失败，避免脚本静默回落到 Python 默认的 `localhost`。
+4. `bash scripts/manage_pg_sync.sh preview` 与 `bash scripts/manage_theme_sync.sh preview` 现在会在目标库配置缺失时直接失败，避免脚本静默回落到 Python 默认的 `localhost`。
+5. 如果要改成系统托管，优先执行：
+   - `bash scripts/manage_pg_sync.sh install`
+   - `bash scripts/manage_theme_sync.sh install`
 
 SSH 隧道同步模式：
 
@@ -95,7 +117,7 @@ SSH 隧道同步模式：
    - `bash scripts/manage_pg_ssh_tunnel.sh status`
    - `bash scripts/manage_pg_ssh_tunnel.sh start`
    - `bash scripts/manage_pg_ssh_tunnel.sh stop`
-7. 当前 `manage_pg_sync.sh preview` / `manage_theme_feature_sync.sh preview` 会打印“单次同步命令”和“循环命令”，方便确认是否已经切到“按轮次开关隧道”的运行模式。
+7. 当前 `manage_pg_sync.sh preview` / `manage_theme_sync.sh preview` 会打印“单次同步命令”和“循环命令”，方便确认是否已经切到“按轮次开关隧道”的运行模式。
 
 PG sync 性能说明：
 

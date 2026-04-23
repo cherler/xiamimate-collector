@@ -62,7 +62,7 @@ require_file "$INIT_SYNC_TABLES_SQL" "Sync schema SQL"
 
 run_check "auto-collect preview" bash "$ROOT_DIR/scripts/manage_auto_collect.sh" preview
 run_check "pg sync preview" bash "$ROOT_DIR/scripts/manage_pg_sync.sh" preview
-run_check "theme feature sync preview" bash "$ROOT_DIR/scripts/manage_theme_feature_sync.sh" preview
+run_check "theme sync preview" bash "$ROOT_DIR/scripts/manage_theme_sync.sh" preview
 run_check "collector CLI help" "$PYTHON_BIN" -m data_collector.cross_border_data --help
 run_check "fetch-categories help" "$PYTHON_BIN" -m data_collector.cross_border_data fetch-categories --help
 run_check "auto-collect help" "$PYTHON_BIN" -m data_collector.cross_border_data auto-collect --help
