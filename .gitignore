@@ -6,4 +6,6 @@ data_collector/.env
 .venv/
 logs/
 data_platform/storage/raw/json/bestsellers
+data_platform/storage/raw/json/products/
 data_platform/storage/raw/json/products/*
+data_platform/storage/raw/*

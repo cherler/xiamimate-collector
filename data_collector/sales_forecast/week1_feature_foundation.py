@@ -3,28 +3,60 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import os
 import shutil
 import tempfile
 
 import duckdb
+from dotenv import load_dotenv
 
 from .bsr_sales_converter import CATEGORY_COEFFICIENTS, DEFAULT_COEFFICIENTS, DOMAIN_MULTIPLIER
 
 
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+
+def _resolve_configured_path(env_name: str, default_path: Path) -> Path:
+    configured = os.environ.get(env_name)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return default_path.resolve()
+
+
+def _resolve_int_env(env_name: str, default_value: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(env_name)
+    if not raw:
+        return default_value
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default_value
+
+
 DEFAULT_SOURCE_DB = (
-    Path(__file__).resolve().parents[2]
-    / "data_platform"
-    / "storage"
-    / "warehouse"
-    / "local_analytics.duckdb"
+    _resolve_configured_path(
+        "XIAMIMATE_DUCKDB_PATH",
+        Path(__file__).resolve().parents[2]
+        / "data_platform"
+        / "storage"
+        / "warehouse"
+        / "local_analytics.duckdb",
+    )
+)
+DEFAULT_DATA_PLATFORM_ROOT = _resolve_configured_path(
+    "XIAMIMATE_DATA_PLATFORM_ROOT",
+    Path("/Volumes/E/data/xiamimate-data-platform"),
 )
 DEFAULT_OUTPUT_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "data_platform"
+    DEFAULT_DATA_PLATFORM_ROOT
     / "storage"
     / "features"
     / "training_sets"
     / "week1_foundation"
+)
+DEFAULT_TEMP_ROOT = _resolve_configured_path(
+    "WEEK1_FOUNDATION_TEMP_ROOT",
+    DEFAULT_DATA_PLATFORM_ROOT / "tmp" / "week1_foundation",
 )
 
 BASE_FEATURE_FILE = "features_base_daily.parquet"
@@ -33,6 +65,8 @@ CROSS_FEATURE_FILE = "features_cross_daily.parquet"
 TRAINING_FEATURE_FILE = "training_dataset_daily.parquet"
 QUALITY_REPORT_FILE = "feature_quality_report.md"
 MANIFEST_FILE = "feature_build_manifest.json"
+DEFAULT_DUCKDB_THREADS = _resolve_int_env("WEEK1_FOUNDATION_DUCKDB_THREADS", 1)
+DEFAULT_DUCKDB_MEMORY_LIMIT = os.environ.get("WEEK1_FOUNDATION_DUCKDB_MEMORY_LIMIT", "16GB")
 
 
 def _domain_multiplier_case() -> str:
@@ -52,105 +86,111 @@ def _category_coeff_case(field_name: str) -> str:
     return f"CASE\n{when_clauses}\nELSE {default_value} END"
 
 
-BASE_FEATURE_SQL = """
-WITH history_enriched AS (
-    SELECT
-        h.asin,
-        h.domain,
-        h.date,
-        h.amazon_price,
-        h.new_price,
-        h.used_price,
-        h.buy_box_price,
-        h.list_price,
-        h.bsr,
-        h.rating,
-        h.review_count,
-        h.monthly_sold,
-        h.new_offer_count,
-        h.used_offer_count,
-        r.marketplace,
-        r.product_title,
-        r.brand,
-        r.category,
-        r.category_id,
-        r.root_category_id,
-        r.category_path,
-        r.is_active,
-        COALESCE(r.root_category_id, r.category_id, 0) AS root_category_key,
-        LAST_VALUE(h.amazon_price IGNORE NULLS) OVER history_window AS amazon_price_ffill,
-        LAST_VALUE(h.new_price IGNORE NULLS) OVER history_window AS new_price_ffill,
-        LAST_VALUE(h.used_price IGNORE NULLS) OVER history_window AS used_price_ffill,
-        LAST_VALUE(h.buy_box_price IGNORE NULLS) OVER history_window AS buy_box_price_ffill,
-        LAST_VALUE(h.list_price IGNORE NULLS) OVER history_window AS list_price_ffill,
-        LAST_VALUE(h.bsr IGNORE NULLS) OVER history_window AS bsr_ffill,
-        LAST_VALUE(h.rating IGNORE NULLS) OVER history_window AS rating_ffill,
-        LAST_VALUE(h.review_count IGNORE NULLS) OVER history_window AS review_count_ffill,
-        LAST_VALUE(h.new_offer_count IGNORE NULLS) OVER history_window AS new_offer_count_ffill,
-        LAST_VALUE(h.used_offer_count IGNORE NULLS) OVER history_window AS used_offer_count_ffill,
-        ROW_NUMBER() OVER (PARTITION BY h.asin, h.domain ORDER BY h.date) AS history_row_number
-    FROM curated.keepa_product_history h
-    LEFT JOIN curated.keepa_asin_registry r
-        ON h.asin = r.asin AND h.domain = r.domain
-    {where_clause}
-    WINDOW history_window AS (
-        PARTITION BY h.asin, h.domain
-        ORDER BY h.date
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    )
-),
-base_features AS (
-    SELECT
-        asin,
-        domain,
-        CONCAT(CAST(domain AS VARCHAR), '::', asin) AS group_id,
-        date,
-        marketplace,
-        product_title,
-        brand,
-        category,
-        category_id,
-        root_category_id,
-        root_category_key,
-        category_path,
-        COALESCE(is_active, TRUE) AS is_active,
-        amazon_price_ffill AS amazon_price,
-        new_price_ffill AS new_price,
-        used_price_ffill AS used_price,
-        buy_box_price_ffill AS buy_box_price,
-        list_price_ffill AS list_price,
-        bsr_ffill AS bsr,
-        rating_ffill AS rating,
-        review_count_ffill AS review_count,
-        monthly_sold,
-        new_offer_count_ffill AS new_offer_count,
-        used_offer_count_ffill AS used_offer_count,
-        COALESCE(buy_box_price_ffill, amazon_price_ffill, new_price_ffill) AS effective_price,
-        CASE
-            WHEN list_price_ffill > 0 AND COALESCE(buy_box_price_ffill, amazon_price_ffill, new_price_ffill) IS NOT NULL THEN
-                ((list_price_ffill - COALESCE(buy_box_price_ffill, amazon_price_ffill, new_price_ffill)) / list_price_ffill) * 100
-            ELSE NULL
-        END AS price_discount_pct,
-        CASE
-            WHEN monthly_sold IS NOT NULL AND monthly_sold > 0 THEN monthly_sold / 30.0
-            WHEN bsr_ffill IS NOT NULL AND bsr_ffill > 0 THEN ({domain_multiplier_case}) * ({coeff_a_case}) * POWER(CAST(bsr_ffill AS DOUBLE), {coeff_b_case})
-            ELSE NULL
-        END AS estimated_daily_sales,
-        CASE
-            WHEN monthly_sold IS NOT NULL AND monthly_sold > 0 THEN 'monthly_sold'
-            WHEN bsr_ffill IS NOT NULL AND bsr_ffill > 0 THEN 'bsr_power_law'
-            ELSE 'unavailable'
-        END AS sales_estimation_method,
-        LN(1 + GREATEST(COALESCE(bsr_ffill, 0), 0)) AS log_bsr,
-        history_row_number,
-        DATE_DIFF('day', MIN(date) OVER (), date) AS time_idx,
-        EXTRACT(ISODOW FROM date) - 1 AS day_of_week,
-        EXTRACT(DAY FROM date) AS day_of_month,
-        EXTRACT(WEEK FROM date) AS week_of_year,
-        EXTRACT(MONTH FROM date) AS month,
-        CASE WHEN EXTRACT(ISODOW FROM date) IN (6, 7) THEN 1 ELSE 0 END AS is_weekend
-    FROM history_enriched
+BASE_HISTORY_SQL = """
+SELECT
+    h.asin,
+    h.domain,
+    h.date,
+    h.amazon_price,
+    h.new_price,
+    h.used_price,
+    h.buy_box_price,
+    h.list_price,
+    h.bsr,
+    h.rating,
+    h.review_count,
+    h.monthly_sold,
+    h.new_offer_count,
+    h.used_offer_count,
+    r.marketplace,
+    r.product_title,
+    r.brand,
+    r.category,
+    r.category_id,
+    r.root_category_id,
+    r.category_path,
+    r.is_active,
+    COALESCE(r.root_category_id, r.category_id, 0) AS root_category_key,
+    LAST_VALUE(h.amazon_price IGNORE NULLS) OVER history_window AS amazon_price_ffill,
+    LAST_VALUE(h.new_price IGNORE NULLS) OVER history_window AS new_price_ffill,
+    LAST_VALUE(h.used_price IGNORE NULLS) OVER history_window AS used_price_ffill,
+    LAST_VALUE(h.buy_box_price IGNORE NULLS) OVER history_window AS buy_box_price_ffill,
+    LAST_VALUE(h.list_price IGNORE NULLS) OVER history_window AS list_price_ffill,
+    LAST_VALUE(h.bsr IGNORE NULLS) OVER history_window AS bsr_ffill,
+    LAST_VALUE(h.rating IGNORE NULLS) OVER history_window AS rating_ffill,
+    LAST_VALUE(h.review_count IGNORE NULLS) OVER history_window AS review_count_ffill,
+    LAST_VALUE(h.new_offer_count IGNORE NULLS) OVER history_window AS new_offer_count_ffill,
+    LAST_VALUE(h.used_offer_count IGNORE NULLS) OVER history_window AS used_offer_count_ffill,
+    ROW_NUMBER() OVER (PARTITION BY h.asin, h.domain ORDER BY h.date) AS history_row_number
+FROM curated.keepa_product_history h
+LEFT JOIN curated.keepa_asin_registry r
+    ON h.asin = r.asin AND h.domain = r.domain
+{where_clause}
+WINDOW history_window AS (
+    PARTITION BY h.asin, h.domain
+    ORDER BY h.date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
 )
+"""
+
+BASE_CORE_SQL = """
+WITH min_date_cte AS (
+    SELECT MIN(date) AS min_date
+    FROM week1_base_history
+)
+SELECT
+    asin,
+    domain,
+    CONCAT(CAST(domain AS VARCHAR), '::', asin) AS group_id,
+    date,
+    marketplace,
+    product_title,
+    brand,
+    category,
+    category_id,
+    root_category_id,
+    root_category_key,
+    category_path,
+    COALESCE(is_active, TRUE) AS is_active,
+    amazon_price_ffill AS amazon_price,
+    new_price_ffill AS new_price,
+    used_price_ffill AS used_price,
+    buy_box_price_ffill AS buy_box_price,
+    list_price_ffill AS list_price,
+    bsr_ffill AS bsr,
+    rating_ffill AS rating,
+    review_count_ffill AS review_count,
+    monthly_sold,
+    new_offer_count_ffill AS new_offer_count,
+    used_offer_count_ffill AS used_offer_count,
+    COALESCE(buy_box_price_ffill, amazon_price_ffill, new_price_ffill) AS effective_price,
+    CASE
+        WHEN list_price_ffill > 0 AND COALESCE(buy_box_price_ffill, amazon_price_ffill, new_price_ffill) IS NOT NULL THEN
+            ((list_price_ffill - COALESCE(buy_box_price_ffill, amazon_price_ffill, new_price_ffill)) / list_price_ffill) * 100
+        ELSE NULL
+    END AS price_discount_pct,
+    CASE
+        WHEN monthly_sold IS NOT NULL AND monthly_sold > 0 THEN monthly_sold / 30.0
+        WHEN bsr_ffill IS NOT NULL AND bsr_ffill > 0 THEN ({domain_multiplier_case}) * ({coeff_a_case}) * POWER(CAST(bsr_ffill AS DOUBLE), {coeff_b_case})
+        ELSE NULL
+    END AS estimated_daily_sales,
+    CASE
+        WHEN monthly_sold IS NOT NULL AND monthly_sold > 0 THEN 'monthly_sold'
+        WHEN bsr_ffill IS NOT NULL AND bsr_ffill > 0 THEN 'bsr_power_law'
+        ELSE 'unavailable'
+    END AS sales_estimation_method,
+    LN(1 + GREATEST(COALESCE(bsr_ffill, 0), 0)) AS log_bsr,
+    history_row_number,
+    DATE_DIFF('day', (SELECT min_date FROM min_date_cte), date) AS time_idx,
+    EXTRACT(ISODOW FROM date) - 1 AS day_of_week,
+    EXTRACT(DAY FROM date) AS day_of_month,
+    EXTRACT(WEEK FROM date) AS week_of_year,
+    EXTRACT(MONTH FROM date) AS month,
+    CASE WHEN EXTRACT(ISODOW FROM date) IN (6, 7) THEN 1 ELSE 0 END AS is_weekend
+FROM week1_base_history
+"""
+
+BASE_LAG_SQL = """
 SELECT
     *,
     bsr - LAG(bsr) OVER series_window AS bsr_change,
@@ -178,7 +218,14 @@ SELECT
     LAG(effective_price, 30) OVER series_window AS effective_price_lag_30,
     LAG(review_count) OVER series_window AS review_count_lag_1,
     LAG(review_count, 7) OVER series_window AS review_count_lag_7,
-    LAG(review_count, 14) OVER series_window AS review_count_lag_14,
+    LAG(review_count, 14) OVER series_window AS review_count_lag_14
+FROM week1_base_core
+WINDOW series_window AS (PARTITION BY asin, domain ORDER BY date)
+"""
+
+BASE_ROLLING_SQL = """
+SELECT
+    *,
     AVG(estimated_daily_sales) OVER rolling_7_window AS estimated_daily_sales_roll_mean_7,
     AVG(estimated_daily_sales) OVER rolling_14_window AS estimated_daily_sales_roll_mean_14,
     AVG(estimated_daily_sales) OVER rolling_30_window AS estimated_daily_sales_roll_mean_30,
@@ -190,9 +237,8 @@ SELECT
     AVG(effective_price) OVER rolling_7_window AS effective_price_roll_mean_7,
     AVG(effective_price) OVER rolling_14_window AS effective_price_roll_mean_14,
     AVG(review_count) OVER rolling_7_window AS review_count_roll_mean_7
-FROM base_features
+FROM week1_base_lag
 WINDOW
-    series_window AS (PARTITION BY asin, domain ORDER BY date),
     rolling_7_window AS (PARTITION BY asin, domain ORDER BY date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW),
     rolling_14_window AS (PARTITION BY asin, domain ORDER BY date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW),
     rolling_30_window AS (PARTITION BY asin, domain ORDER BY date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW)
@@ -381,12 +427,19 @@ def build_week1_feature_tables(
     include_training: bool = True,
 ) -> None:
     base_where_clause = _build_base_where_clause(domain=domain, active_only=active_only)
-    conn.execute("CREATE OR REPLACE TEMP TABLE week1_base_daily AS " + BASE_FEATURE_SQL.format(
+    conn.execute("CREATE OR REPLACE TEMP TABLE week1_base_history AS " + BASE_HISTORY_SQL.format(
         where_clause=base_where_clause,
+    ))
+    conn.execute("CREATE OR REPLACE TEMP TABLE week1_base_core AS " + BASE_CORE_SQL.format(
         domain_multiplier_case=_domain_multiplier_case(),
         coeff_a_case=_category_coeff_case("coeff_a"),
         coeff_b_case=_category_coeff_case("coeff_b"),
     ))
+    conn.execute("DROP TABLE week1_base_history")
+    conn.execute("CREATE OR REPLACE TEMP TABLE week1_base_lag AS " + BASE_LAG_SQL)
+    conn.execute("DROP TABLE week1_base_core")
+    conn.execute("CREATE OR REPLACE TEMP TABLE week1_base_daily AS " + BASE_ROLLING_SQL)
+    conn.execute("DROP TABLE week1_base_lag")
 
     mapping_where_clause = _build_mapping_where_clause(domain=domain, active_only=active_only)
     conn.execute("CREATE OR REPLACE TEMP TABLE week1_trends_daily AS " + TREND_FEATURE_SQL.format(
@@ -421,13 +474,17 @@ class Week1FeatureFoundationBuilder:
             raise FileNotFoundError(f"DuckDB source not found: {self.source_db_path}")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="xiamimate_week1_") as temp_dir:
+        DEFAULT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="xiamimate_week1_", dir=DEFAULT_TEMP_ROOT) as temp_dir:
             snapshot_path = Path(temp_dir) / self.source_db_path.name
             shutil.copy2(self.source_db_path, snapshot_path)
 
             conn = duckdb.connect(str(snapshot_path))
             try:
-                conn.execute("SET threads TO 4")
+                conn.execute(f"SET temp_directory='{Path(temp_dir).as_posix()}'")
+                conn.execute("SET preserve_insertion_order=false")
+                conn.execute(f"SET memory_limit='{DEFAULT_DUCKDB_MEMORY_LIMIT}'")
+                conn.execute(f"SET threads TO {DEFAULT_DUCKDB_THREADS}")
                 self._build_tables(conn)
                 output_paths = self._write_parquet_outputs(conn)
                 report_path = self._write_quality_report(conn)

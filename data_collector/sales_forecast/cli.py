@@ -4,9 +4,14 @@ import argparse
 from pathlib import Path
 import sys
 
+from dotenv import load_dotenv
+
 from .dataset_builder import SalesForecastDatasetBuilder
 from .feature_matrix import FeatureMatrixBuilder
 from .week1_feature_foundation import Week1FeatureFoundationBuilder
+
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def main() -> None:
