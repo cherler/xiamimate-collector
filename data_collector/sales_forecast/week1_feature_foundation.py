@@ -402,7 +402,7 @@ LEFT JOIN week1_base_rolling r
 TREND_FEATURE_SQL = """
 WITH keyword_totals AS (
     SELECT asin, domain, COUNT(DISTINCT keyword) AS total_keywords
-    FROM curated.asin_keyword_mapping
+    FROM curated.asin_keyword_mapping m
     {where_clause}
     GROUP BY 1, 2
 ),
@@ -686,7 +686,7 @@ class Week1FeatureFoundationBuilder:
                 conn.execute(f"SET memory_limit='{DEFAULT_DUCKDB_MEMORY_LIMIT}'")
                 conn.execute(f"SET threads TO {self.duckdb_threads}")
                 self._build_tables(conn)
-                output_paths = self._write_parquet_outputs(conn)
+                output_paths = self._write_parquet_outputs(conn, temp_dir=Path(temp_dir))
                 self._log("writing quality report")
                 report_path = self._write_quality_report(conn)
                 self._log(f"wrote quality report {report_path}")
@@ -743,7 +743,7 @@ class Week1FeatureFoundationBuilder:
     def _build_registry_where_clause(self) -> str:
         return _build_registry_where_clause(domain=self.domain, active_only=self.active_only)
 
-    def _write_parquet_outputs(self, conn: duckdb.DuckDBPyConnection) -> dict[str, Path]:
+    def _write_parquet_outputs(self, conn: duckdb.DuckDBPyConnection, *, temp_dir: Path) -> dict[str, Path]:
         output_map = {
             "base_features": ("week1_base_daily", self.output_dir / BASE_FEATURE_FILE),
         }
@@ -760,9 +760,15 @@ class Week1FeatureFoundationBuilder:
         for table_name, output_path in output_map.values():
             row_count = _count_rows(conn, table_name)
             self._log(f"writing parquet table={table_name} rows={row_count} path={output_path}")
+            temp_output_path = temp_dir / f"tmp_{output_path.name}"
+            if temp_output_path.exists():
+                temp_output_path.unlink()
             conn.execute(
-                f"COPY (SELECT * FROM {table_name}) TO '{output_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+                f"COPY (SELECT * FROM {table_name}) TO '{temp_output_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)"
             )
+            if output_path.exists():
+                output_path.unlink()
+            shutil.move(str(temp_output_path), str(output_path))
         return {name: path for name, (_, path) in output_map.items()}
 
     def _write_quality_report(self, conn: duckdb.DuckDBPyConnection) -> Path:

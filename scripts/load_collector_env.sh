@@ -43,6 +43,8 @@ if [[ -z "${XIAMIMATE_RUNTIME_ROOT:-}" ]]; then
     fi
 fi
 
+set_default_if_missing "XIAMIMATE_DATA_PLATFORM_ROOT" "/Volumes/E/data/xiamimate-data-platform"
+
 if [[ -z "${XIAMIMATE_DATA_INFRA_ROOT:-}" ]]; then
     default_data_infra_root="$(cd "$ROOT_DIR/../xiamimate-data-infra" 2>/dev/null && pwd || true)"
     if [[ -n "$default_data_infra_root" && -d "$default_data_infra_root" ]]; then
