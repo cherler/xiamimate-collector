@@ -36,6 +36,19 @@ if [[ -f "$COLLECTOR_ENV_FILE" ]]; then
     set +a
 fi
 
+if collector_is_truthy "${XIAMIMATE_COLLECTOR_FORCE_LOCAL_PG:-}"; then
+    PG_HOST="${XIAMIMATE_COLLECTOR_LOCAL_PG_HOST:-localhost}"
+    PG_PORT="${XIAMIMATE_COLLECTOR_LOCAL_PG_PORT:-5432}"
+    PG_DB="${XIAMIMATE_COLLECTOR_LOCAL_PG_DB:-xiamimate}"
+    PG_USER="${XIAMIMATE_COLLECTOR_LOCAL_PG_USER:-xiamimate}"
+    PG_PASSWORD="${XIAMIMATE_COLLECTOR_LOCAL_PG_PASSWORD:-xiamimate}"
+    PGPASSWORD="$PG_PASSWORD"
+    PG_TUNNEL_ENABLED=0
+    unset PG_TUNNEL_SSH_HOST
+    unset PG_TUNNEL_REMOTE_HOST
+    unset PG_TUNNEL_REMOTE_PORT
+fi
+
 if [[ -z "${XIAMIMATE_RUNTIME_ROOT:-}" ]]; then
     default_runtime_root="$(cd "$ROOT_DIR/../xiamimate-runtime" 2>/dev/null && pwd || true)"
     if [[ -n "$default_runtime_root" && -d "$default_runtime_root" ]]; then
@@ -248,3 +261,9 @@ export PG_TUNNEL_REMOTE_HOST
 export PG_TUNNEL_REMOTE_PORT
 export PG_TUNNEL_PID_FILE
 export PG_TUNNEL_LOG_FILE
+export XIAMIMATE_COLLECTOR_FORCE_LOCAL_PG
+export XIAMIMATE_COLLECTOR_LOCAL_PG_HOST
+export XIAMIMATE_COLLECTOR_LOCAL_PG_PORT
+export XIAMIMATE_COLLECTOR_LOCAL_PG_DB
+export XIAMIMATE_COLLECTOR_LOCAL_PG_USER
+export XIAMIMATE_COLLECTOR_LOCAL_PG_PASSWORD
