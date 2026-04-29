@@ -198,6 +198,7 @@ collector_pg_tunnel_summary() {
 collector_pg_tunnel_resolve_pid() {
     local pid_file
     local pid
+    local local_port
 
     pid_file="$(collector_pg_tunnel_pid_file)"
     if [[ -f "$pid_file" ]]; then
@@ -206,6 +207,14 @@ collector_pg_tunnel_resolve_pid() {
             echo "$pid"
             return 0
         fi
+    fi
+
+    local_port="${PG_TUNNEL_LOCAL_PORT:-15432}"
+    pid="$(lsof -tiTCP:"$local_port" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "$pid" > "$pid_file"
+        echo "$pid"
+        return 0
     fi
 
     return 1

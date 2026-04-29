@@ -45,7 +45,9 @@ from .collectors.product import (
     KeepaCollector,
     normalize_keepa_product_snapshot,
 )
+from .expansion_jobs import ExpansionJob, ExpansionJobStore
 from .storage import DuckDBStorage
+from .token_allocator import KeepaTokenAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +207,8 @@ class AutoCollector:
             base_url=keepa_base_url,
             api_key=keepa_api_key,
         )
+        self.token_allocator = KeepaTokenAllocator.from_env()
+        self.expansion_job_store = ExpansionJobStore()
 
         # 首次运行: 从 CSV 同步类目到 DuckDB category_registry
         self._ensure_category_registry()
@@ -229,6 +233,7 @@ class AutoCollector:
             "strategy_asins_discovered": 0,
             "tokens_start": 0,
             "tokens_end": 0,
+            "interactive_expansion_pending": False,
             "errors": [],
         }
 
@@ -276,6 +281,13 @@ class AutoCollector:
             tokens_left = token_info.get("tokens_left", 0)
             self._stats["tokens_start"] = tokens_left
             logger.info(f"当前 token 余量: {tokens_left}")
+            interactive_pending = self.token_allocator.has_pending_interactive_jobs(domain=self.domain)
+            self._stats["interactive_expansion_pending"] = interactive_pending
+            if interactive_pending:
+                logger.info("检测到交互式补池任务排队, auto-collect 将保留 token 并限制 history 消耗")
+
+            # 0.2 交互式补池任务优先于后台 auto-collect discovery/history。
+            self._run_interactive_expansion_job(tokens_left=tokens_left)
 
             # 0.5 自动停用不活跃 ASIN
             self._auto_deactivate()
@@ -293,7 +305,7 @@ class AutoCollector:
             if self.enable_google_trends:
                 self._fetch_google_trends()
 
-            # 3.5 下一阶段自动扩张: L2/L3 shortlist + Google Trends keyword
+            # 3.5 下一阶段自动扩张: L2/L3/L4 shortlist + Google Trends keyword
             self._run_strategy_expansion()
 
         except Exception as e:
@@ -364,6 +376,322 @@ class AutoCollector:
         return dict(self._stats)
 
     # ------------------------------------------------------------------
+    # Phase 0.2: 交互式补池 job
+    # ------------------------------------------------------------------
+
+    def _run_interactive_expansion_job(self, *, tokens_left: int) -> None:
+        if not self.expansion_job_store.enabled:
+            return
+        try:
+            hydrate_job = self.expansion_job_store.claim_next_hydration_job(domain=self.domain)
+            if hydrate_job is not None:
+                self._hydrate_interactive_expansion_job(hydrate_job, tokens_left=tokens_left)
+                return
+            job = self.expansion_job_store.claim_next_interactive_job(domain=self.domain)
+        except Exception as e:
+            logger.warning(f"读取补池任务失败: {e}")
+            return
+        if job is None:
+            return
+
+        logger.info(
+            f"处理补池任务 {job.job_id}: category_id={job.category_id}, "
+            f"target={job.target_asin_count}, priority={job.priority}"
+        )
+
+        try:
+            tokens_before = tokens_left
+            if job.category_id is not None:
+                discovery_cost = self.token_allocator.budget.bestseller_min_tokens
+                decision = self.token_allocator.can_run(
+                    queue_name="interactive",
+                    tokens_left=tokens_left,
+                    cost=discovery_cost,
+                    interactive_pending=True,
+                )
+                if not decision.allowed:
+                    self.expansion_job_store.mark_waiting_token(
+                        job_id=job.job_id,
+                        tokens_left=tokens_left,
+                        reason=decision.reason,
+                    )
+                    logger.info(f"补池任务 {job.job_id} 等待 token: {decision.reason}")
+                    return
+                all_asins, raw_payload = self.discovery.fetch_best_sellers(
+                    category=job.category_id,
+                    domain=self.domain,
+                )
+                raw_category = "expansion_bestsellers"
+                raw_label = f"job_{job.job_id}_cat_{job.category_id}"
+                discovery_source = "interactive_expansion_bestseller"
+            elif job.product_query:
+                discovery_cost = max(
+                    SEARCH_PRODUCTS_TOKENS_PER_PAGE,
+                    self.token_allocator.budget.search_min_tokens,
+                )
+                decision = self.token_allocator.can_run(
+                    queue_name="interactive",
+                    tokens_left=tokens_left,
+                    cost=discovery_cost,
+                    interactive_pending=True,
+                )
+                if not decision.allowed:
+                    self.expansion_job_store.mark_waiting_token(
+                        job_id=job.job_id,
+                        tokens_left=tokens_left,
+                        reason=decision.reason,
+                    )
+                    logger.info(f"补池任务 {job.job_id} 等待 token: {decision.reason}")
+                    return
+                all_asins = self.discovery.search_products(
+                    term=job.product_query,
+                    domain=self.domain,
+                )
+                raw_payload = {"asinList": all_asins, "term": job.product_query}
+                raw_category = "expansion_search"
+                raw_label = f"job_{job.job_id}_search"
+                discovery_source = "interactive_expansion_search"
+            else:
+                self.expansion_job_store.mark_failed(
+                    job_id=job.job_id,
+                    error_message="category_id or product_query is required for expansion discovery",
+                )
+                return
+
+            target_count = max(1, min(job.target_asin_count, 100))
+            asins = all_asins[:target_count]
+            raw_path = _save_raw_response(
+                raw_payload,
+                category=raw_category,
+                label=raw_label,
+                domain=self.domain,
+                asins=asins,
+            )
+            if raw_path:
+                self.storage.upsert_asin_raw_file_mappings(
+                    asins=asins,
+                    domain=self.domain,
+                    source=discovery_source,
+                    raw_file_path=raw_path,
+                )
+
+            discovered = [
+                {
+                    "asin": asin,
+                    "domain": self.domain,
+                    "category_id": job.category_id,
+                    "category_path": job.category_path,
+                    "search_term": job.product_query,
+                    "discovery_source": discovery_source,
+                    "priority": 100,
+                }
+                for asin in asins
+            ]
+            new_count = self.storage.register_asins(discovered)
+            if job.category_id is not None:
+                self.storage.mark_category_bestseller_done(job.category_id, self.domain, len(asins))
+            try:
+                token_now = self.collector.check_token_status()
+                tokens_after = token_now.get("tokens_left", max(0, tokens_before - discovery_cost))
+            except Exception:
+                tokens_after = max(0, tokens_before - discovery_cost)
+            self.expansion_job_store.mark_hydrating(
+                job_id=job.job_id,
+                result_candidate_asins=asins,
+                result_new_asin_count=new_count,
+                tokens_before=tokens_before,
+                tokens_after=tokens_after,
+            )
+            self._stats["asins_discovered"] += new_count
+            logger.info(
+                f"补池任务 {job.job_id}: discovery 返回 {len(all_asins)} 个 ASIN, "
+                f"注册新增 {new_count} 个, 状态转为 hydrating"
+            )
+            hydrate_job = ExpansionJob(
+                job_id=job.job_id,
+                domain=job.domain,
+                marketplace=job.marketplace,
+                priority=job.priority,
+                product_query=job.product_query,
+                recall_mode=job.recall_mode,
+                category_id=job.category_id,
+                category_path=job.category_path,
+                include_descendants=job.include_descendants,
+                target_asin_count=job.target_asin_count,
+                tokens_estimated=job.tokens_estimated,
+                result_candidate_asins=asins,
+                result_new_asin_count=new_count,
+            )
+            self._hydrate_interactive_expansion_job(hydrate_job, tokens_left=tokens_after)
+        except Exception as e:
+            logger.warning(f"补池任务 {job.job_id} 执行失败: {e}")
+            self.expansion_job_store.mark_failed(job_id=job.job_id, error_message=str(e))
+
+    def _hydrate_interactive_expansion_job(self, job: ExpansionJob, *, tokens_left: int) -> None:
+        asins = list(dict.fromkeys(job.result_candidate_asins or []))
+        if not asins:
+            self.expansion_job_store.mark_syncing(
+                job_id=job.job_id,
+                result_candidate_asins=[],
+                result_new_asin_count=job.result_new_asin_count,
+                tokens_before=tokens_left,
+                tokens_after=tokens_left,
+            )
+            logger.info(f"补池任务 {job.job_id}: 无候选 ASIN, 状态转为 syncing 等待完成态回写")
+            return
+
+        target_count = max(1, min(job.target_asin_count, len(asins)))
+        hydrate_asins = asins[:target_count]
+        hydrate_cost = max(1, len(hydrate_asins) * self.tokens_per_history)
+        decision = self.token_allocator.can_run(
+            queue_name="interactive",
+            tokens_left=tokens_left,
+            cost=hydrate_cost,
+            interactive_pending=True,
+        )
+        if not decision.allowed:
+            self.expansion_job_store.mark_hydrating_waiting_token(
+                job_id=job.job_id,
+                tokens_left=tokens_left,
+                reason=decision.reason,
+            )
+            logger.info(f"补池任务 {job.job_id} hydrate 等待 token: {decision.reason}")
+            return
+
+        tokens_before = tokens_left
+        batch_start = time.time()
+        try:
+            history_rows, raw = self.collector.fetch_product_history(
+                asins=hydrate_asins,
+                domain=self.domain,
+            )
+            returned_asins = {row["asin"] for row in history_rows if row.get("asin")}
+            missing_asins = [asin for asin in hydrate_asins if asin not in returned_asins]
+            if missing_asins:
+                self.storage.deactivate_asins(
+                    [(asin, self.domain) for asin in missing_asins],
+                    reason="no_data",
+                )
+                logger.info(f"补池任务 {job.job_id}: {len(missing_asins)} 个 ASIN 在 Keepa 中无数据, 已停用")
+
+            ingested = self.storage.ingest_keepa_history(history_rows, domain=self.domain)
+            snapshot_rows = []
+            capture_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            for product in raw.get("raw_products", {}).get("products", []):
+                snapshot_rows.append(
+                    normalize_keepa_product_snapshot(
+                        product,
+                        domain=self.domain,
+                        update_time=capture_time,
+                        source_url=self.keepa_base_url,
+                    )
+                )
+            snapshot_ingested = self.storage.ingest_keepa_product_snapshots(
+                snapshot_rows,
+                domain=self.domain,
+            )
+
+            for asin in hydrate_asins:
+                self.storage.mark_fetched(asin, self.domain)
+
+            for product in raw.get("raw_products", {}).get("products", []):
+                category_tree = product.get("categoryTree")
+                category_path = None
+                root_category_id = None
+                if category_tree and isinstance(category_tree, list) and len(category_tree) > 0:
+                    names = [node.get("name", "") for node in category_tree if node.get("name")]
+                    if names:
+                        category_path = " > ".join(names)
+                    root_category_id = category_tree[0].get("catId")
+                    tree_categories = []
+                    for index, node in enumerate(category_tree):
+                        tree_categories.append({
+                            "category_id": node.get("catId"),
+                            "category_en": node.get("name"),
+                            "parent_id": category_tree[index - 1].get("catId") if index > 0 else None,
+                            "depth": index + 1,
+                            "product_count": 0,
+                        })
+                    if tree_categories:
+                        self.storage.upsert_categories_from_tree(tree_categories, domain=self.domain)
+
+                self.storage.update_asin_metadata(
+                    product.get("asin", ""),
+                    self.domain,
+                    product_title=product.get("title"),
+                    brand=product.get("brand"),
+                    category=product.get("productGroup"),
+                    category_path=category_path,
+                    root_category_id=root_category_id,
+                )
+
+                title = product.get("title", "")
+                if title:
+                    keywords = extract_keywords_from_title(title, max_keywords=3)
+                    keywords = [keyword for keyword in keywords if len(keyword.split()) >= 2 and len(keyword) <= 50]
+                    if keywords:
+                        self.storage.upsert_asin_keywords(product.get("asin", ""), self.domain, keywords)
+
+            raw_path = _save_raw_response(
+                raw.get("raw_products", {}),
+                category="expansion_products",
+                label=f"job_{job.job_id}_hydrate",
+                domain=self.domain,
+                asins=hydrate_asins,
+                compression="gzip",
+            )
+            if raw_path:
+                self.storage.upsert_asin_raw_file_mappings(
+                    asins=hydrate_asins,
+                    domain=self.domain,
+                    source="interactive_expansion_hydrate",
+                    raw_file_path=raw_path,
+                )
+
+            try:
+                token_now = self.collector.check_token_status()
+                tokens_after = token_now.get("tokens_left", max(0, tokens_before - hydrate_cost))
+            except Exception:
+                tokens_after = max(0, tokens_before - hydrate_cost)
+
+            duration_seconds = round(time.time() - batch_start, 1)
+            try:
+                self.storage.log_collection(
+                    source="interactive_expansion_hydrate",
+                    domain=self.domain,
+                    asins_requested=len(hydrate_asins),
+                    asins_succeeded=len(returned_asins),
+                    rows_ingested=ingested,
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_after,
+                    tokens_consumed=max(0, tokens_before - tokens_after),
+                    duration_seconds=duration_seconds,
+                    raw_file_path=str(raw_path) if raw_path else None,
+                    error_message=None,
+                    started_at=datetime.fromtimestamp(batch_start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                )
+            except Exception as log_error:
+                logger.warning(f"写入补池 hydrate 日志失败: {log_error}")
+
+            self._stats["asins_fetched"] += len(hydrate_asins)
+            self._stats["history_rows_ingested"] += ingested
+            self._stats["snapshot_rows_ingested"] += snapshot_ingested
+            self.expansion_job_store.mark_syncing(
+                job_id=job.job_id,
+                result_candidate_asins=asins,
+                result_new_asin_count=job.result_new_asin_count,
+                tokens_before=tokens_before,
+                tokens_after=tokens_after,
+            )
+            logger.info(
+                f"补池任务 {job.job_id}: hydrate {len(hydrate_asins)} 个 ASIN, "
+                f"写入 {ingested} 行历史/{snapshot_ingested} 行快照, 状态转为 syncing"
+            )
+        except Exception as e:
+            logger.warning(f"补池任务 {job.job_id} hydrate 失败: {e}")
+            self.expansion_job_store.mark_failed(job_id=job.job_id, error_message=str(e))
+
+    # ------------------------------------------------------------------
     # Phase 0.5: 自动停用不活跃 ASIN
     # ------------------------------------------------------------------
 
@@ -404,13 +732,20 @@ class AutoCollector:
             domain=self.domain, max_count=99999, stale_hours=self.stale_hours,
         ))
 
-        # 优先消费注册表。只有当待采集池为空时才读下一个类目的 BestSeller
-        if pending_count > 0:
+        interactive_pending = bool(self._stats.get("interactive_expansion_pending"))
+
+        # 默认允许 discovery 在 pending ASIN 非空时按预算执行, 防止 history 长期占用导致发现任务饿死。
+        if pending_count > 0 and not self.token_allocator.budget.allow_discovery_with_pending:
             logger.info(f"待采集池有 {pending_count} 个 ASIN, 跳过 BestSeller")
             if all_discovered:
                 new_count = self.storage.register_asins(all_discovered)
                 self._stats["asins_discovered"] = new_count
             return
+        if pending_count > 0:
+            logger.info(
+                f"待采集池有 {pending_count} 个 ASIN, 但 AUTO_DISCOVERY_ALLOW_WHEN_PENDING=true, "
+                "按 token 预算继续尝试 BestSeller/search discovery"
+            )
 
         # 1c. 待采集池为空 → 从 category_registry 取下一个未读过 BestSeller 的类目
         cat_stats = self.storage.get_category_stats(self.domain)
@@ -437,10 +772,15 @@ class AutoCollector:
         except Exception:
             tokens_left = 0
 
-        if tokens_left < 50:
+        decision = self.token_allocator.can_run(
+            queue_name="auto_discovery",
+            tokens_left=tokens_left,
+            cost=self.token_allocator.budget.bestseller_min_tokens,
+            interactive_pending=interactive_pending,
+        )
+        if not decision.allowed:
             logger.info(
-                f"token 不足 ({tokens_left} < 50), 无法拉取 BestSeller, "
-                f"跳过类目 {cat_id} ({cat_name})"
+                f"token 预算不足 ({decision.reason}), 无法拉取 BestSeller, 跳过类目 {cat_id} ({cat_name})"
             )
             if all_discovered:
                 new_count = self.storage.register_asins(all_discovered)
@@ -520,10 +860,15 @@ class AutoCollector:
         for term in self.search_terms:
             try:
                 token_info = self.collector.check_token_status()
-                required_tokens = SEARCH_PRODUCTS_TOKENS_PER_PAGE + self.min_tokens_reserve
-                if token_info.get("tokens_left", 0) < required_tokens:
+                decision = self.token_allocator.can_run(
+                    queue_name="auto_discovery",
+                    tokens_left=token_info.get("tokens_left", 0),
+                    cost=max(SEARCH_PRODUCTS_TOKENS_PER_PAGE, self.token_allocator.budget.search_min_tokens),
+                    interactive_pending=interactive_pending,
+                )
+                if not decision.allowed:
                     logger.warning(
-                        f"token 不足 ({token_info.get('tokens_left', 0)} < {required_tokens}), 跳过剩余搜索"
+                        f"token 预算不足 ({decision.reason}), 跳过剩余搜索"
                     )
                     break
 
@@ -601,8 +946,17 @@ class AutoCollector:
                 self._fetch_trends_during_wait(wait_secs)
                 continue
 
+            interactive_pending = self.token_allocator.has_pending_interactive_jobs(domain=self.domain)
+            history_budget = self.token_allocator.history_token_budget(
+                tokens_left=tokens_left,
+                interactive_pending=interactive_pending,
+            )
+            if not history_budget.allowed:
+                logger.info(f"history 采集暂停: {history_budget.reason}")
+                break
+
             # 动态计算本批可采集数量: min(max_batch_size, token余量/每ASIN消耗)
-            max_asins_by_token = tokens_left // self.tokens_per_history
+            max_asins_by_token = history_budget.tokens_available_for_queue // self.tokens_per_history
             batch_limit = min(self.batch_size, max_asins_by_token)
             if batch_limit <= 0:
                 time.sleep(60)
@@ -814,14 +1168,14 @@ class AutoCollector:
         pending_count = len(pending)
         if pending_count > self.strategy_pending_threshold:
             logger.info(
-                f"待采集池仍有 {pending_count} 个 ASIN (> {self.strategy_pending_threshold}), 暂不做 L2/L3 / keyword 扩张"
+                f"待采集池仍有 {pending_count} 个 ASIN (> {self.strategy_pending_threshold}), 暂不做 L2/L3/L4 / keyword 扩张"
             )
             return
 
         try:
             self._expand_shortlist_categories()
         except Exception:
-            logger.exception("L2/L3 shortlist 扩张异常, 继续执行 keyword 扩张")
+            logger.exception("L2/L3/L4 shortlist 扩张异常, 继续执行 keyword 扩张")
         try:
             self._expand_keywords()
         except Exception:
@@ -834,10 +1188,10 @@ class AutoCollector:
             cooldown_hours=self.strategy_category_cooldown_hours,
         )
         if not candidates:
-            logger.info("未找到可扩张的 L2/L3 shortlist 类目")
+            logger.info("未找到可扩张的 L2/L3/L4 shortlist 类目")
             return
 
-        logger.info(f"L2/L3 shortlist 候选 {len(candidates)} 个")
+        logger.info(f"L2/L3/L4 shortlist 候选 {len(candidates)} 个")
         for index, candidate in enumerate(candidates):
             try:
                 token_info = self.collector.check_token_status()
@@ -846,8 +1200,8 @@ class AutoCollector:
                 tokens_before = 0
 
             if tokens_before < 50 + self.min_tokens_reserve:
-                logger.info(f"token 不足 ({tokens_before})，跳过剩余 L2/L3 扩张")
-                logger.info("本轮未执行的 L2/L3 shortlist 候选不会写入 cooldown；后续 token 恢复后会重新参与扩张")
+                logger.info(f"token 不足 ({tokens_before})，跳过剩余 L2/L3/L4 扩张")
+                logger.info("本轮未执行的 L2/L3/L4 shortlist 候选不会写入 cooldown；后续 token 恢复后会重新参与扩张")
                 try:
                     self.storage.log_collection(
                         source="strategy_category_skip",
@@ -864,7 +1218,7 @@ class AutoCollector:
                         started_at=_utc_now_str(),
                     )
                 except Exception as e:
-                    logger.warning(f"写入 L2/L3 token skip 日志失败: {e}")
+                    logger.warning(f"写入 L2/L3/L4 token skip 日志失败: {e}")
                 break
 
             category_id = int(candidate["category_id"])
@@ -931,11 +1285,11 @@ class AutoCollector:
                 self._stats["strategy_categories_selected"] += 1
                 self._stats["strategy_asins_discovered"] += new_count
                 logger.info(
-                    f"L2/L3 扩张: {category_id} ({category_name}) -> top {requested}, 新增 {new_count}, score={shortlist_score}"
+                    f"L2/L3/L4 扩张: {category_id} ({category_name}) -> top {requested}, 新增 {new_count}, score={shortlist_score}"
                 )
             except Exception as e:
                 error_message = str(e)
-                logger.warning(f"L2/L3 扩张失败: {category_id} ({category_name}) -> {e}")
+                logger.warning(f"L2/L3/L4 扩张失败: {category_id} ({category_name}) -> {e}")
                 self._stats["errors"].append(f"subcategory_expand_{category_id}: {e}")
 
             try:
@@ -959,7 +1313,7 @@ class AutoCollector:
                     started_at=started_at,
                 )
             except Exception as e:
-                logger.warning(f"写入 L2/L3 扩张日志失败: {e}")
+                logger.warning(f"写入 L2/L3/L4 扩张日志失败: {e}")
 
     def _expand_keywords(self) -> None:
         candidates = self.storage.get_keyword_expansion_candidates(
@@ -1317,7 +1671,55 @@ def _resolve_raw_dir() -> Path:
     return (Path(__file__).resolve().parents[2] / "data_platform" / "storage" / "raw" / "json").resolve()
 
 
+def _resolve_fallback_raw_dir() -> Path | None:
+    fallback_root = os.environ.get("XIAMIMATE_RAW_JSON_FALLBACK_ROOT")
+    if fallback_root:
+        return Path(fallback_root).expanduser().resolve()
+
+    return None
+
+
 _RAW_DIR = _resolve_raw_dir()
+_FALLBACK_RAW_DIR = _resolve_fallback_raw_dir()
+
+
+def _write_raw_response_files(
+    *,
+    out_dir: Path,
+    payload: dict | list,
+    label: str,
+    timestamp: str,
+    compression: str,
+    category: str,
+    domain: int | None,
+    asins: list[str] | None,
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if compression == "gzip":
+        path = out_dir / f"{label}_{timestamp}.json.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as output_file:
+            json.dump(payload, output_file, ensure_ascii=False, default=str)
+    else:
+        path = out_dir / f"{label}_{timestamp}.json"
+        with open(path, "w", encoding="utf-8") as output_file:
+            json.dump(payload, output_file, ensure_ascii=False, default=str)
+
+    meta_path = out_dir / f"{label}_{timestamp}.meta.json"
+    meta_payload = {
+        "category": category,
+        "label": label,
+        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "domain": domain,
+        "asin_count": len(asins or []),
+        "asins": asins or [],
+        "json_file": path.name,
+        "compression": compression,
+        "is_compressed": compression == "gzip",
+    }
+    with open(meta_path, "w", encoding="utf-8") as output_file:
+        json.dump(meta_payload, output_file, ensure_ascii=False, indent=2)
+
+    return path
 
 
 def _save_raw_response(
@@ -1341,38 +1743,39 @@ def _save_raw_response(
     Path or None
         保存路径, 失败返回 None.
     """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     try:
-        out_dir = _RAW_DIR / category
-        out_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        if compression == "gzip":
-            path = out_dir / f"{label}_{ts}.json.gz"
-            with gzip.open(path, "wt", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, default=str)
-        else:
-            path = out_dir / f"{label}_{ts}.json"
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, default=str)
-
-        meta_path = out_dir / f"{label}_{ts}.meta.json"
-        meta_payload = {
-            "category": category,
-            "label": label,
-            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "domain": domain,
-            "asin_count": len(asins or []),
-            "asins": asins or [],
-            "json_file": path.name,
-            "compression": compression,
-            "is_compressed": compression == "gzip",
-        }
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_payload, f, ensure_ascii=False, indent=2)
-
+        path = _write_raw_response_files(
+            out_dir=_RAW_DIR / category,
+            payload=payload,
+            label=label,
+            timestamp=ts,
+            compression=compression,
+            category=category,
+            domain=domain,
+            asins=asins,
+        )
         logger.debug(f"保存原始响应: {path}")
         return path
-    except Exception as e:
-        logger.warning(f"保存原始响应失败: {e}")
+    except Exception as primary_error:
+        if _FALLBACK_RAW_DIR is None or _FALLBACK_RAW_DIR == _RAW_DIR:
+            logger.warning(f"保存原始响应失败: {primary_error}")
+            return None
+        try:
+            fallback_path = _write_raw_response_files(
+                out_dir=_FALLBACK_RAW_DIR / category,
+                payload=payload,
+                label=label,
+                timestamp=ts,
+                compression=compression,
+                category=category,
+                domain=domain,
+                asins=asins,
+            )
+            logger.warning(f"保存原始响应到主目录失败: {primary_error}; 已写入 fallback: {fallback_path}")
+            return fallback_path
+        except Exception as fallback_error:
+            logger.warning(f"保存原始响应失败: primary={primary_error}; fallback={fallback_error}")
         return None
 
 

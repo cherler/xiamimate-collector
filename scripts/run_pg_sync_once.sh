@@ -18,7 +18,7 @@ DUCKDB_PATH="${PG_SYNC_DUCKDB_PATH:-${XIAMIMATE_DUCKDB_PATH:-${DUCKDB_PATH:-}}}"
 mkdir -p "$LOG_DIR"
 
 cleanup_tunnel() {
-    if collector_pg_tunnel_enabled; then
+    if collector_pg_tunnel_enabled && [[ "${PG_SYNC_TUNNEL_KEEPALIVE:-true}" != "true" ]]; then
         PG_TUNNEL_LOCAL_HOST="$PG_SYNC_TUNNEL_LOCAL_HOST_VALUE" \
         PG_TUNNEL_LOCAL_PORT="$PG_SYNC_TUNNEL_LOCAL_PORT_VALUE" \
         PG_TUNNEL_PID_FILE="$PG_SYNC_TUNNEL_PID_FILE_VALUE" \
@@ -36,7 +36,9 @@ PG_SYNC_TUNNEL_LOG_FILE_VALUE="${PG_SYNC_TUNNEL_LOG_FILE:-$LOG_DIR/pg_sync_ssh_t
 
 if collector_pg_tunnel_enabled; then
     collector_require_pg_tunnel_env
-    trap cleanup_tunnel EXIT
+    if [[ "${PG_SYNC_TUNNEL_KEEPALIVE:-true}" != "true" ]]; then
+        trap cleanup_tunnel EXIT
+    fi
 
     PG_TUNNEL_LOCAL_HOST="$PG_SYNC_TUNNEL_LOCAL_HOST_VALUE" \
     PG_TUNNEL_LOCAL_PORT="$PG_SYNC_TUNNEL_LOCAL_PORT_VALUE" \

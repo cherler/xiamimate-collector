@@ -1634,7 +1634,7 @@ class DuckDBStorage:
         cooldown_hours: int = 720,
         min_sample_asins: int = 10,
     ) -> list[dict[str, Any]]:
-        """返回下一阶段 L2/L3 shortlist 扩张候选类目."""
+        """返回下一阶段 L2/L3/L4 shortlist 扩张候选类目."""
         rows = self.conn.execute(
             """
             WITH latest_history AS (
@@ -1694,41 +1694,66 @@ class DuckDBStorage:
                 FROM curated.keepa_product_snapshot
                 WHERE domain = ?
             ),
-            categorized AS (
+            path_parts AS (
                 SELECT
                     r.asin,
                     r.domain,
-                    COALESCE(kr3.category_id, kr2.category_id) AS target_category_id,
-                    COALESCE(
-                        COALESCE(kr3.category_cn, kr3.category_en),
-                        COALESCE(kr2.category_cn, kr2.category_en)
-                    ) AS target_category_name,
-                    CASE
-                        WHEN kr3.category_id IS NOT NULL THEN 3
-                        WHEN kr2.category_id IS NOT NULL THEN 2
-                        ELSE NULL
-                    END AS target_category_depth
+                    r.root_category_id,
+                    r.category_path,
+                    NULLIF(TRIM(split_part(r.category_path, ' > ', 2)), '') AS l2_name,
+                    NULLIF(TRIM(split_part(r.category_path, ' > ', 3)), '') AS l3_name,
+                    NULLIF(TRIM(split_part(r.category_path, ' > ', 4)), '') AS l4_name
                 FROM curated.keepa_asin_registry r
-                LEFT JOIN curated.keepa_category_registry kr2
-                  ON kr2.domain = r.domain
-                 AND kr2.parent_id = r.root_category_id
-                 AND kr2.depth = 2
-                 AND kr2.category_en = NULLIF(split_part(r.category_path, ' > ', 2), '')
-                LEFT JOIN curated.keepa_category_registry kr3
-                  ON kr3.domain = r.domain
-                 AND kr3.parent_id = kr2.category_id
-                 AND kr3.depth = 3
-                 AND kr3.category_en = NULLIF(split_part(r.category_path, ' > ', 3), '')
                 WHERE r.is_active = TRUE
                   AND r.domain = ?
                   AND r.root_category_id IS NOT NULL
                   AND r.category_path IS NOT NULL
                   AND r.category_path <> ''
+            ),
+            categorized AS (
+                SELECT
+                    p.asin,
+                    p.domain,
+                    COALESCE(kr4.category_id, kr3.category_id, kr2.category_id) AS target_category_id,
+                    COALESCE(
+                        COALESCE(kr4.category_cn, kr4.category_en),
+                        COALESCE(kr3.category_cn, kr3.category_en),
+                        COALESCE(kr2.category_cn, kr2.category_en)
+                    ) AS target_category_name,
+                    CASE
+                        WHEN kr4.category_id IS NOT NULL THEN concat_ws(' > ', split_part(p.category_path, ' > ', 1), p.l2_name, p.l3_name, p.l4_name)
+                        WHEN kr3.category_id IS NOT NULL THEN concat_ws(' > ', split_part(p.category_path, ' > ', 1), p.l2_name, p.l3_name)
+                        WHEN kr2.category_id IS NOT NULL THEN concat_ws(' > ', split_part(p.category_path, ' > ', 1), p.l2_name)
+                        ELSE NULL
+                    END AS target_category_path,
+                    CASE
+                        WHEN kr4.category_id IS NOT NULL THEN 4
+                        WHEN kr3.category_id IS NOT NULL THEN 3
+                        WHEN kr2.category_id IS NOT NULL THEN 2
+                        ELSE NULL
+                    END AS target_category_depth
+                FROM path_parts p
+                LEFT JOIN curated.keepa_category_registry kr2
+                  ON kr2.domain = p.domain
+                 AND kr2.parent_id = p.root_category_id
+                 AND kr2.depth = 2
+                 AND (kr2.category_en = p.l2_name OR kr2.category_cn = p.l2_name)
+                LEFT JOIN curated.keepa_category_registry kr3
+                  ON kr3.domain = p.domain
+                 AND kr3.parent_id = kr2.category_id
+                 AND kr3.depth = 3
+                 AND (kr3.category_en = p.l3_name OR kr3.category_cn = p.l3_name)
+                LEFT JOIN curated.keepa_category_registry kr4
+                  ON kr4.domain = p.domain
+                 AND kr4.parent_id = kr3.category_id
+                 AND kr4.depth = 4
+                 AND (kr4.category_en = p.l4_name OR kr4.category_cn = p.l4_name)
             )
             SELECT
                 c.domain,
                 c.target_category_id AS category_id,
                 c.target_category_name AS category_name,
+                c.target_category_path AS category_path,
                 c.target_category_depth AS category_depth,
                 MAX(COALESCE(kt.product_count, 0)) AS category_product_count,
                 COUNT(*) AS sample_asin_count,
@@ -1755,13 +1780,13 @@ class DuckDBStorage:
              AND s.domain = c.domain
              AND s.target_key = CAST(c.target_category_id AS VARCHAR)
             WHERE c.target_category_id IS NOT NULL
-            GROUP BY 1, 2, 3, 4
+            GROUP BY 1, 2, 3, 4, 5
             """,
             [domain, domain, domain, domain, domain],
         ).fetchall()
 
         columns = [
-            "domain", "category_id", "category_name", "category_depth", "category_product_count",
+            "domain", "category_id", "category_name", "category_path", "category_depth", "category_product_count",
             "sample_asin_count", "median_effective_price_30d", "avg_monthly_sold_30d",
             "avg_offer_count_30d", "trend_index_30d", "trend_growth_7d", "avg_history_days_30d", "last_run_at",
         ]
@@ -1769,7 +1794,7 @@ class DuckDBStorage:
         candidates: list[dict[str, Any]] = []
         for row in rows:
             item = dict(zip(columns, row))
-            if int(item.get("category_depth") or 0) not in (2, 3):
+            if int(item.get("category_depth") or 0) not in (2, 3, 4):
                 continue
             if int(item.get("sample_asin_count") or 0) < min_sample_asins:
                 continue
@@ -1818,6 +1843,7 @@ class DuckDBStorage:
         candidates.sort(
             key=lambda item: (
                 item["shortlist_score"],
+                item.get("category_depth") or 0,
                 item.get("trend_score") or 0,
                 item.get("demand_score") or 0,
                 item.get("coverage_gap_score") or 0,

@@ -571,6 +571,57 @@ def sync_table(
     return total_rows
 
 
+def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
+    """Mark expansion jobs completed once their discovered ASINs are visible in PG."""
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH progress AS (
+                SELECT
+                    j.job_id,
+                    CARDINALITY(COALESCE(j.result_candidate_asins, ARRAY[]::TEXT[])) AS expected_asin_count,
+                    COUNT(DISTINCT r.asin) AS synced_asin_count
+                FROM sync.keepa_candidate_expansion_jobs j
+                LEFT JOIN sync.keepa_asin_registry r
+                  ON r.domain = j.domain
+                 AND r.asin = ANY(COALESCE(j.result_candidate_asins, ARRAY[]::TEXT[]))
+                WHERE j.status = 'syncing'
+                GROUP BY j.job_id, j.result_candidate_asins
+            ),
+            ready_jobs AS (
+                SELECT job_id, expected_asin_count, synced_asin_count
+                FROM progress
+                WHERE expected_asin_count = 0
+                   OR synced_asin_count >= expected_asin_count
+            )
+            UPDATE sync.keepa_candidate_expansion_jobs j
+            SET status = 'completed',
+                status_reason = CASE
+                    WHEN ready_jobs.expected_asin_count = 0 THEN 'No ASINs returned; PostgreSQL sync not required'
+                    ELSE 'Expansion ASINs synced to PostgreSQL'
+                END,
+                updated_at = NOW(),
+                finished_at = NOW(),
+                meta_json = COALESCE(j.meta_json, '{}'::JSONB)
+                    || jsonb_build_object(
+                        'pg_expected_asin_count', ready_jobs.expected_asin_count,
+                        'pg_synced_asin_count', ready_jobs.synced_asin_count,
+                        'sync_reconciled_at', NOW()
+                    )
+            FROM ready_jobs
+            WHERE j.job_id = ready_jobs.job_id
+            RETURNING j.job_id
+            """
+        )
+        completed = cur.fetchall()
+    pg_conn.commit()
+
+    completed_count = len(completed)
+    if completed_count:
+        logger.info("  expansion jobs: marked %s syncing jobs as completed", completed_count)
+    return completed_count
+
+
 def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path = DEFAULT_SYNC_STATE_PATH) -> dict:
     """执行一轮同步."""
     logger.info(f"{'全量' if full else '增量'}同步开始 — DuckDB: {duckdb_path}")
@@ -603,6 +654,12 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
                 logger.error(f"  同步 {duck_table} 失败: {e}")
                 pg_conn.rollback()
                 results[duck_table] = -1
+        try:
+            results["sync.keepa_candidate_expansion_jobs:reconciled"] = _reconcile_candidate_expansion_jobs_completion(pg_conn)
+        except Exception as e:
+            logger.warning("  expansion jobs 状态协调失败: %s", e)
+            pg_conn.rollback()
+            results["sync.keepa_candidate_expansion_jobs:reconciled"] = -1
     finally:
         duck.close()
         pg_conn.close()

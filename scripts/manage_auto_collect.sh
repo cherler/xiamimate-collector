@@ -219,6 +219,62 @@ build_command() {
     printf '%q ' "${cmd[@]}"
 }
 
+xml_escape() {
+    local value="$1"
+    value="${value//&/&amp;}"
+    value="${value//</&lt;}"
+    value="${value//>/&gt;}"
+    value="${value//\"/&quot;}"
+    value="${value//\'/&apos;}"
+    printf '%s' "$value"
+}
+
+write_program_arguments_xml() {
+    local args=(
+        "$PYTHON_BIN"
+        -m
+        data_collector.cross_border_data
+        auto-collect
+        --domain "$DOMAIN"
+        --loop
+        --interval-minutes "$INTERVAL_MINUTES"
+        --batch-size "$BATCH_SIZE"
+        --stale-hours "$STALE_HOURS"
+        --lock-file "$LOCK_FILE"
+    )
+
+    if [[ "$ENABLE_TRENDS" == "true" ]]; then
+        args+=(--enable-trends)
+    else
+        args+=(--disable-trends)
+    fi
+
+    if [[ "$ENABLE_STRATEGY_EXPANSION" == "true" ]]; then
+        args+=(
+            --enable-strategy-expansion
+            --strategy-pending-threshold "$STRATEGY_PENDING_THRESHOLD"
+            --strategy-category-limit "$STRATEGY_CATEGORY_LIMIT"
+            --strategy-keyword-limit "$STRATEGY_KEYWORD_LIMIT"
+            --strategy-category-cooldown-hours "$STRATEGY_CATEGORY_COOLDOWN_HOURS"
+            --strategy-keyword-cooldown-hours "$STRATEGY_KEYWORD_COOLDOWN_HOURS"
+        )
+    fi
+
+    if [[ -n "$DB_PATH" ]]; then
+        args+=(--db-path "$DB_PATH")
+    fi
+
+    if [[ -n "$EXTRA_ARGS" ]]; then
+        # shellcheck disable=SC2206
+        local extra=( $EXTRA_ARGS )
+        args+=("${extra[@]}")
+    fi
+
+    for arg in "${args[@]}"; do
+        printf '        <string>%s</string>\n' "$(xml_escape "$arg")"
+    done
+}
+
 start_auto_collect() {
     if is_running; then
         echo "auto-collect already running: PID $(resolve_pid)"
@@ -242,6 +298,17 @@ start_auto_collect() {
 
     echo "auto-collect started: PID $(resolve_pid)"
     echo "log file: $LOG_FILE"
+}
+
+foreground_auto_collect() {
+    cleanup_metadata
+
+    local command
+    command="$(build_command)"
+    echo "auto-collect foreground mode"
+    echo "log file: $LOG_FILE"
+    cd "$ROOT_DIR"
+    eval "exec env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY $command"
 }
 
 stop_auto_collect() {
@@ -326,9 +393,6 @@ launchd_pid() {
 }
 
 write_launchd_plist() {
-    local command
-    command="$(build_command)"
-
     cat > "$PLIST_DST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -342,9 +406,7 @@ write_launchd_plist() {
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/zsh</string>
-        <string>-lc</string>
-        <string>cd '${ROOT_DIR}' &amp;&amp; env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY ${command}</string>
+$(write_program_arguments_xml)
     </array>
 
     <key>EnvironmentVariables</key>
@@ -353,6 +415,14 @@ write_launchd_plist() {
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONPATH</key>
         <string>${ROOT_DIR}</string>
+        <key>XIAMIMATE_LOG_DIR</key>
+        <string>${LOG_DIR}</string>
+        <key>XIAMIMATE_RAW_JSON_ROOT</key>
+        <string>${XIAMIMATE_RAW_JSON_ROOT:-}</string>
+        <key>XIAMIMATE_RAW_PRODUCTS_DIR</key>
+        <string>${XIAMIMATE_RAW_PRODUCTS_DIR:-}</string>
+        <key>XIAMIMATE_RAW_JSON_FALLBACK_ROOT</key>
+        <string>${XIAMIMATE_RAW_JSON_FALLBACK_ROOT:-}</string>
     </dict>
 
     <key>KeepAlive</key>
@@ -465,6 +535,9 @@ case "${1:-}" in
             restart_auto_collect
         fi
         ;;
+    foreground)
+        foreground_auto_collect
+        ;;
     status)
         if is_launchd_loaded; then
             echo "auto-collect managed by launchd: $PLIST_NAME"
@@ -487,13 +560,14 @@ case "${1:-}" in
         preview_auto_collect
         ;;
     *)
-        echo "Usage: bash scripts/manage_auto_collect.sh {start|stop|restart|status|install|uninstall|logs|preview}"
+        echo "Usage: bash scripts/manage_auto_collect.sh {start|stop|restart|foreground|status|install|uninstall|logs|preview}"
         echo ""
         echo "  install    安装 launchd 服务 (推荐: 开机自启+崩溃重启+休眠恢复)"
         echo "  uninstall  卸载 launchd 服务"
         echo "  start      启动 (优先 launchd, 否则 nohup)"
         echo "  stop       停止"
         echo "  restart    重启"
+        echo "  foreground 前台运行 (用于继承当前终端/VS Code 的外置卷权限)"
         echo "  status     查看状态"
         echo "  logs       查看最近日志"
         echo "  preview    仅打印解析后的命令与路径, 不启动进程"
