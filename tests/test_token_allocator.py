@@ -59,7 +59,7 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
                 "PG_TUNNEL_LOCAL_HOST": "127.0.0.1",
                 "PG_TUNNEL_LOCAL_PORT": "15432",
             },
-            clear=False,
+            clear=True,
         ):
             config = pg_connection_config()
 

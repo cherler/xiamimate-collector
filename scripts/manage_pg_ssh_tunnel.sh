@@ -10,8 +10,9 @@ source "$ROOT_DIR/scripts/load_collector_env.sh"
 
 PID_FILE="$(collector_pg_tunnel_pid_file)"
 LOG_FILE="$(collector_pg_tunnel_log_file)"
+START_LOCK_DIR="${PG_TUNNEL_START_LOCK_DIR:-${XIAMIMATE_LOG_DIR:-$ROOT_DIR/logs}/pg_ssh_tunnel.${PG_TUNNEL_LOCAL_PORT:-15432}.start.lock}"
 
-mkdir -p "${XIAMIMATE_LOG_DIR:-$ROOT_DIR/logs}"
+mkdir -p "${XIAMIMATE_LOG_DIR:-$ROOT_DIR/logs}" "$(dirname "$START_LOCK_DIR")"
 
 cleanup_metadata() {
     rm -f "$PID_FILE"
@@ -37,6 +38,28 @@ build_command() {
     )
 
     printf '%q ' "${cmd[@]}"
+}
+
+acquire_start_lock() {
+    local attempt=0
+
+    while ! mkdir "$START_LOCK_DIR" 2>/dev/null; do
+        if is_running; then
+            return 1
+        fi
+        if (( attempt >= 50 )); then
+            echo "failed to acquire pg tunnel start lock: $START_LOCK_DIR" >&2
+            return 2
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    return 0
+}
+
+release_start_lock() {
+    rmdir "$START_LOCK_DIR" 2>/dev/null || true
 }
 
 print_summary() {
@@ -65,6 +88,27 @@ start_tunnel() {
         return 0
     fi
 
+    local lock_status
+    set +e
+    acquire_start_lock
+    lock_status=$?
+    set -e
+    if (( lock_status == 1 )); then
+        echo "pg ssh tunnel already running: PID $(resolve_pid)"
+        print_summary
+        return 0
+    fi
+    if (( lock_status != 0 )); then
+        return 1
+    fi
+
+    if is_running; then
+        release_start_lock
+        echo "pg ssh tunnel already running: PID $(resolve_pid)"
+        print_summary
+        return 0
+    fi
+
     cleanup_metadata
     local command
     command="$(build_command)"
@@ -75,11 +119,13 @@ start_tunnel() {
     if ! is_running; then
         echo "failed to start pg ssh tunnel; check log: $LOG_FILE" >&2
         cleanup_metadata
+        release_start_lock
         return 1
     fi
 
     echo "pg ssh tunnel started: PID $(resolve_pid)"
     print_summary
+    release_start_lock
 }
 
 stop_tunnel() {

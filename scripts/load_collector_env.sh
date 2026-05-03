@@ -29,12 +29,53 @@ set_default_if_missing() {
     export "$var_name"
 }
 
+COLLECTOR_ENV_OVERRIDE_NAMES=(
+    PG_TUNNEL_LOCAL_HOST
+    PG_TUNNEL_LOCAL_PORT
+    PG_TUNNEL_PID_FILE
+    PG_TUNNEL_LOG_FILE
+    PG_TUNNEL_START_LOCK_DIR
+    PG_SYNC_TUNNEL_LOCAL_HOST
+    PG_SYNC_TUNNEL_LOCAL_PORT
+    PG_SYNC_TUNNEL_PID_FILE
+    PG_SYNC_TUNNEL_LOG_FILE
+    PG_SYNC_TUNNEL_KEEPALIVE
+    THEME_FEATURE_SYNC_TUNNEL_LOCAL_HOST
+    THEME_FEATURE_SYNC_TUNNEL_LOCAL_PORT
+    THEME_FEATURE_SYNC_TUNNEL_PID_FILE
+    THEME_FEATURE_SYNC_TUNNEL_LOG_FILE
+    THEME_FEATURE_SYNC_TUNNEL_KEEPALIVE
+)
+COLLECTOR_ENV_OVERRIDE_PRESENT=()
+COLLECTOR_ENV_OVERRIDE_VALUES=()
+
+for collector_env_var_name in "${COLLECTOR_ENV_OVERRIDE_NAMES[@]}"; do
+    if [[ -n "${!collector_env_var_name+x}" ]]; then
+        COLLECTOR_ENV_OVERRIDE_PRESENT+=(1)
+        COLLECTOR_ENV_OVERRIDE_VALUES+=("${!collector_env_var_name}")
+    else
+        COLLECTOR_ENV_OVERRIDE_PRESENT+=(0)
+        COLLECTOR_ENV_OVERRIDE_VALUES+=("")
+    fi
+done
+
 if [[ -f "$COLLECTOR_ENV_FILE" ]]; then
     set -a
     # shellcheck disable=SC1090
     source "$COLLECTOR_ENV_FILE"
     set +a
 fi
+
+
+for collector_env_var_index in "${!COLLECTOR_ENV_OVERRIDE_NAMES[@]}"; do
+    if [[ "${COLLECTOR_ENV_OVERRIDE_PRESENT[$collector_env_var_index]}" == "1" ]]; then
+        printf -v "${COLLECTOR_ENV_OVERRIDE_NAMES[$collector_env_var_index]}" '%s' "${COLLECTOR_ENV_OVERRIDE_VALUES[$collector_env_var_index]}"
+        export "${COLLECTOR_ENV_OVERRIDE_NAMES[$collector_env_var_index]}"
+    fi
+done
+
+unset collector_env_var_index collector_env_var_name
+unset COLLECTOR_ENV_OVERRIDE_NAMES COLLECTOR_ENV_OVERRIDE_PRESENT COLLECTOR_ENV_OVERRIDE_VALUES
 
 if collector_is_truthy "${XIAMIMATE_COLLECTOR_FORCE_LOCAL_PG:-}"; then
     PG_HOST="${XIAMIMATE_COLLECTOR_LOCAL_PG_HOST:-localhost}"
@@ -201,15 +242,18 @@ collector_pg_tunnel_resolve_pid() {
     local local_port
 
     pid_file="$(collector_pg_tunnel_pid_file)"
+    local_port="${PG_TUNNEL_LOCAL_PORT:-15432}"
     if [[ -f "$pid_file" ]]; then
         pid="$(cat "$pid_file")"
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            echo "$pid"
-            return 0
+            if lsof -nP -a -p "$pid" -iTCP:"$local_port" -sTCP:LISTEN >/dev/null 2>&1; then
+                echo "$pid"
+                return 0
+            fi
         fi
     fi
 
-    local_port="${PG_TUNNEL_LOCAL_PORT:-15432}"
+    rm -f "$pid_file"
     pid="$(lsof -tiTCP:"$local_port" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
         echo "$pid" > "$pid_file"

@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -88,6 +89,18 @@ PG_SYNC_FETCH_BATCH_SIZE = max(
 )
 PG_AGG_REFRESH_INTERVAL_SECONDS = max(
     300, int(os.environ.get("PG_AGG_REFRESH_INTERVAL_SECONDS", "3600"))
+)
+TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE = os.environ.get(
+    "PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE",
+    "true",
+).lower() not in {"0", "false", "no", "off"}
+THEME_SYNC_TRIGGER_TIMEOUT_SECONDS = max(
+    60,
+    int(os.environ.get("PG_SYNC_TRIGGER_THEME_SYNC_TIMEOUT_SECONDS", "900")),
+)
+THEME_SYNC_TRIGGER_SCRIPT = _resolve_configured_path(
+    "PG_SYNC_TRIGGER_THEME_SYNC_SCRIPT",
+    PROJECT_ROOT / "scripts" / "run_theme_feature_sync_once.sh",
 )
 
 HISTORY_DOMAIN_DAILY_SQL = f"""
@@ -572,7 +585,7 @@ def sync_table(
 
 
 def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
-    """Mark expansion jobs completed once their discovered ASINs are visible in PG."""
+    """Mark expansion jobs completed only after discovered ASINs are synced and fetched."""
     with pg_conn.cursor() as cur:
         cur.execute(
             """
@@ -580,7 +593,60 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                 SELECT
                     j.job_id,
                     CARDINALITY(COALESCE(j.result_candidate_asins, ARRAY[]::TEXT[])) AS expected_asin_count,
-                    COUNT(DISTINCT r.asin) AS synced_asin_count
+                    COUNT(DISTINCT r.asin) AS synced_asin_count,
+                    COUNT(DISTINCT r.asin) FILTER (WHERE r.last_fetched_at IS NOT NULL) AS fetched_asin_count,
+                    COUNT(DISTINCT s.asin) AS snapshot_hit_count,
+                    COUNT(DISTINCT h.asin) AS history_hit_count
+                FROM sync.keepa_candidate_expansion_jobs j
+                LEFT JOIN sync.keepa_asin_registry r
+                  ON r.domain = j.domain
+                 AND r.asin = ANY(COALESCE(j.result_candidate_asins, ARRAY[]::TEXT[]))
+                LEFT JOIN sync.keepa_product_snapshot s
+                  ON s.domain = j.domain
+                 AND s.asin = r.asin
+                LEFT JOIN sync.keepa_product_history h
+                  ON h.domain = j.domain
+                 AND h.asin = r.asin
+                WHERE j.status IN ('syncing', 'completed')
+                GROUP BY j.job_id, j.result_candidate_asins
+            ),
+            incomplete_hydration_jobs AS (
+                SELECT job_id, expected_asin_count, synced_asin_count, fetched_asin_count,
+                       snapshot_hit_count, history_hit_count
+                FROM progress
+                WHERE expected_asin_count > 0
+                  AND synced_asin_count >= expected_asin_count
+                  AND fetched_asin_count < expected_asin_count
+            )
+            UPDATE sync.keepa_candidate_expansion_jobs j
+            SET status = 'hydrating',
+                status_reason = 'Registry sync completed but candidate hydration is incomplete; requeued by PostgreSQL sync reconcile',
+                updated_at = NOW(),
+                finished_at = NULL,
+                meta_json = COALESCE(j.meta_json, '{}'::JSONB)
+                    || jsonb_build_object(
+                        'pg_expected_asin_count', incomplete_hydration_jobs.expected_asin_count,
+                        'pg_synced_asin_count', incomplete_hydration_jobs.synced_asin_count,
+                        'pg_fetched_asin_count', incomplete_hydration_jobs.fetched_asin_count,
+                        'pg_snapshot_hit_count', incomplete_hydration_jobs.snapshot_hit_count,
+                        'pg_history_hit_count', incomplete_hydration_jobs.history_hit_count,
+                        'hydration_requeued_at', NOW()
+                    )
+            FROM incomplete_hydration_jobs
+            WHERE j.job_id = incomplete_hydration_jobs.job_id
+            RETURNING j.job_id
+            """
+        )
+        requeued = cur.fetchall()
+
+        cur.execute(
+            """
+            WITH progress AS (
+                SELECT
+                    j.job_id,
+                    CARDINALITY(COALESCE(j.result_candidate_asins, ARRAY[]::TEXT[])) AS expected_asin_count,
+                    COUNT(DISTINCT r.asin) AS synced_asin_count,
+                    COUNT(DISTINCT r.asin) FILTER (WHERE r.last_fetched_at IS NOT NULL) AS fetched_asin_count
                 FROM sync.keepa_candidate_expansion_jobs j
                 LEFT JOIN sync.keepa_asin_registry r
                   ON r.domain = j.domain
@@ -592,13 +658,13 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                 SELECT job_id, expected_asin_count, synced_asin_count
                 FROM progress
                 WHERE expected_asin_count = 0
-                   OR synced_asin_count >= expected_asin_count
+                   OR (synced_asin_count >= expected_asin_count AND fetched_asin_count >= expected_asin_count)
             )
             UPDATE sync.keepa_candidate_expansion_jobs j
             SET status = 'completed',
                 status_reason = CASE
                     WHEN ready_jobs.expected_asin_count = 0 THEN 'No ASINs returned; PostgreSQL sync not required'
-                    ELSE 'Expansion ASINs synced to PostgreSQL'
+                    ELSE 'Expansion ASINs synced to PostgreSQL after candidate hydration'
                 END,
                 updated_at = NOW(),
                 finished_at = NOW(),
@@ -616,10 +682,53 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
         completed = cur.fetchall()
     pg_conn.commit()
 
+    requeued_count = len(requeued)
+    if requeued_count:
+        logger.info("  expansion jobs: requeued %s jobs for incomplete hydration", requeued_count)
+
     completed_count = len(completed)
     if completed_count:
         logger.info("  expansion jobs: marked %s syncing jobs as completed", completed_count)
     return completed_count
+
+
+def _trigger_theme_sync_after_expansion_reconcile(completed_count: int) -> bool:
+    """Run theme feature sync after expansion jobs become completed."""
+    if completed_count <= 0:
+        return False
+    if not TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE:
+        logger.info(
+            "  expansion jobs: theme feature sync trigger disabled after %s completed jobs",
+            completed_count,
+        )
+        return False
+    if not THEME_SYNC_TRIGGER_SCRIPT.exists():
+        logger.warning("  theme feature sync trigger script not found: %s", THEME_SYNC_TRIGGER_SCRIPT)
+        return False
+
+    logger.info(
+        "  expansion jobs: triggering theme feature sync after %s completed jobs",
+        completed_count,
+    )
+    try:
+        subprocess.run(
+            ["/bin/bash", str(THEME_SYNC_TRIGGER_SCRIPT)],
+            cwd=str(PROJECT_ROOT),
+            check=True,
+            timeout=THEME_SYNC_TRIGGER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "  theme feature sync trigger timed out after %ss",
+            THEME_SYNC_TRIGGER_TIMEOUT_SECONDS,
+        )
+        return False
+    except subprocess.CalledProcessError as exc:
+        logger.warning("  theme feature sync trigger failed: exit_code=%s", exc.returncode)
+        return False
+
+    logger.info("  expansion jobs: theme feature sync trigger completed")
+    return True
 
 
 def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path = DEFAULT_SYNC_STATE_PATH) -> dict:
@@ -627,6 +736,7 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
     logger.info(f"{'全量' if full else '增量'}同步开始 — DuckDB: {duckdb_path}")
     start = time.time()
     results = {}
+    reconciled_expansion_jobs = 0
     sync_state = _load_sync_state(state_path)
 
     duck = get_duckdb_conn(duckdb_path)
@@ -655,7 +765,8 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
                 pg_conn.rollback()
                 results[duck_table] = -1
         try:
-            results["sync.keepa_candidate_expansion_jobs:reconciled"] = _reconcile_candidate_expansion_jobs_completion(pg_conn)
+            reconciled_expansion_jobs = _reconcile_candidate_expansion_jobs_completion(pg_conn)
+            results["sync.keepa_candidate_expansion_jobs:reconciled"] = reconciled_expansion_jobs
         except Exception as e:
             logger.warning("  expansion jobs 状态协调失败: %s", e)
             pg_conn.rollback()
@@ -665,6 +776,10 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
         pg_conn.close()
 
     _save_sync_state(state_path, sync_state)
+
+    results["serving.theme_feature_sync:triggered"] = int(
+        _trigger_theme_sync_after_expansion_reconcile(reconciled_expansion_jobs)
+    )
 
     elapsed = round(time.time() - start, 1)
     total = sum(v for v in results.values() if v > 0)

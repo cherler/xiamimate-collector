@@ -541,7 +541,26 @@ class AutoCollector:
             return
 
         target_count = max(1, min(job.target_asin_count, len(asins)))
-        hydrate_asins = asins[:target_count]
+        candidate_asins = asins[:target_count]
+        hydrate_asins = self.storage.filter_asins_to_fetch(
+            candidate_asins,
+            domain=self.domain,
+            stale_hours=self.stale_hours,
+        )
+        if not hydrate_asins:
+            self.expansion_job_store.mark_syncing(
+                job_id=job.job_id,
+                result_candidate_asins=asins,
+                result_new_asin_count=job.result_new_asin_count,
+                tokens_before=tokens_left,
+                tokens_after=tokens_left,
+            )
+            logger.info(
+                f"补池任务 {job.job_id}: {len(candidate_asins)} 个候选 ASIN 已完成 hydrate, "
+                "状态转为 syncing 等待完成态回写"
+            )
+            return
+
         hydrate_cost = max(1, len(hydrate_asins) * self.tokens_per_history)
         decision = self.token_allocator.can_run(
             queue_name="interactive",
@@ -684,7 +703,7 @@ class AutoCollector:
                 tokens_after=tokens_after,
             )
             logger.info(
-                f"补池任务 {job.job_id}: hydrate {len(hydrate_asins)} 个 ASIN, "
+                f"补池任务 {job.job_id}: hydrate {len(hydrate_asins)}/{len(candidate_asins)} 个待补水 ASIN, "
                 f"写入 {ingested} 行历史/{snapshot_ingested} 行快照, 状态转为 syncing"
             )
         except Exception as e:

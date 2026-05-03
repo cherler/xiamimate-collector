@@ -559,6 +559,33 @@ class DuckDBStorage:
         ]
         return [dict(zip(columns, row)) for row in rows]
 
+    def filter_asins_to_fetch(
+        self,
+        asins: list[str],
+        *,
+        domain: int = 1,
+        stale_hours: int = 336,
+    ) -> list[str]:
+        """Return input ASINs that still need history hydration, preserving input order."""
+        ordered_asins = list(dict.fromkeys([asin for asin in asins if asin]))
+        if not ordered_asins:
+            return []
+
+        stale_hours_sql = _build_dynamic_stale_hours_sql(int(stale_hours))
+        placeholders = ", ".join(["?"] * len(ordered_asins))
+        rows = self.conn.execute(
+            f"""SELECT asin
+               FROM curated.keepa_asin_registry
+               WHERE domain = ?
+                 AND is_active = TRUE
+                 AND asin IN ({placeholders})
+                 AND (last_fetched_at IS NULL
+                      OR date_diff('hour', last_fetched_at, CURRENT_TIMESTAMP) >= ({stale_hours_sql}))""",
+            [domain] + ordered_asins,
+        ).fetchall()
+        pending_asins = {row[0] for row in rows}
+        return [asin for asin in ordered_asins if asin in pending_asins]
+
     def mark_fetched(self, asin: str, domain: int = 1) -> None:
         """标记 ASIN 已采集."""
         now = _utc_now()

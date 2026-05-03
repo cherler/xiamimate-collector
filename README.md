@@ -107,12 +107,15 @@ SSH 隧道同步模式：
    - `PG_TUNNEL_LOCAL_HOST=127.0.0.1`
    - `PG_TUNNEL_REMOTE_HOST=your-instance.pg.rds.aliyuncs.com`
    - `PG_TUNNEL_REMOTE_PORT=5432`
-3. 如果两个循环任务都启用 SSH 隧道，建议分别使用不同的本地转发端口：
-   - `PG_SYNC_TUNNEL_LOCAL_PORT=15432`
-   - `THEME_FEATURE_SYNC_TUNNEL_LOCAL_PORT=15433`
-4. 启用后，两个循环任务会在每一轮真正执行同步前启动各自的 SSH 隧道，本轮同步结束后关闭隧道，而不是整条循环进程生命周期一直保持隧道常驻。
-5. 因为 `pg sync` 与 `theme feature sync` 使用各自的本地端口、PID 文件和日志文件，所以两个循环可以并行运行，不会争抢同一条 SSH 隧道。
-6. 共享隧道也可以单独管理：
+3. 如果多个本地服务都启用 SSH 隧道，默认按服务分配独立本地端口，避免同时启动时争抢同一个 listen port：
+   - `auto-collect`: `PG_TUNNEL_LOCAL_PORT=15432`
+   - `pg-sync`: `PG_SYNC_TUNNEL_LOCAL_PORT=15433`
+   - `theme-sync`: `THEME_FEATURE_SYNC_TUNNEL_LOCAL_PORT=15434`
+   - `theme-api`: 建议 `PG_PORT=15435`
+   - `chat-backend`: 建议 `PG_PORT=15436`
+4. 启用后，各同步任务会在每一轮真正执行前确保自己的 SSH 隧道可用；默认 keepalive，不在每轮结束后关闭。只有显式设置 `THEME_FEATURE_SYNC_TUNNEL_KEEPALIVE=false` 时，theme-sync 才会按单次任务生命周期关闭自己的隧道。
+5. 当 `pg sync` 将补池任务从 `syncing` 协调为 `completed` 后，会自动触发一次 `theme feature sync`，让 `serving.theme_base_daily` 尽快追上最新补池 ASIN。触发的 theme-sync 使用 `THEME_FEATURE_SYNC_TUNNEL_LOCAL_PORT`。
+6. auto-collect 的通用隧道也可以单独管理：
    - `bash scripts/manage_pg_ssh_tunnel.sh preview`
    - `bash scripts/manage_pg_ssh_tunnel.sh status`
    - `bash scripts/manage_pg_ssh_tunnel.sh start`

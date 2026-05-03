@@ -25,7 +25,7 @@ PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
 mkdir -p "$LOG_DIR"
 
 SYNC_TUNNEL_LOCAL_HOST="${PG_SYNC_TUNNEL_LOCAL_HOST:-${PG_TUNNEL_LOCAL_HOST:-127.0.0.1}}"
-SYNC_TUNNEL_LOCAL_PORT="${PG_SYNC_TUNNEL_LOCAL_PORT:-15432}"
+SYNC_TUNNEL_LOCAL_PORT="${PG_SYNC_TUNNEL_LOCAL_PORT:-15433}"
 SYNC_TUNNEL_PID_FILE="${PG_SYNC_TUNNEL_PID_FILE:-$LOG_DIR/pg_sync_ssh_tunnel.pid}"
 SYNC_TUNNEL_LOG_FILE="${PG_SYNC_TUNNEL_LOG_FILE:-$LOG_DIR/pg_sync_ssh_tunnel.log}"
 
@@ -80,9 +80,12 @@ tunnel_is_running() {
     local pid
     if [[ -f "$SYNC_TUNNEL_PID_FILE" ]]; then
         pid="$(cat "$SYNC_TUNNEL_PID_FILE")"
-        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-        return $?
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            lsof -nP -a -p "$pid" -iTCP:"$SYNC_TUNNEL_LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1
+            return $?
+        fi
     fi
+    rm -f "$SYNC_TUNNEL_PID_FILE"
     return 1
 }
 
