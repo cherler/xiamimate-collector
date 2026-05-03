@@ -46,6 +46,7 @@ from .collectors.product import (
     normalize_keepa_product_snapshot,
 )
 from .expansion_jobs import ExpansionJob, ExpansionJobStore
+from .seller_scope import evaluate_seller_scope, filter_seller_scope_keywords
 from .storage import DuckDBStorage
 from .token_allocator import KeepaTokenAllocator
 
@@ -90,6 +91,18 @@ _EXCLUDED_CATEGORY_IDS = {
     19419898011,  # Amazon Explore
     14297978011,  # Online Learning
     2625373011,   # Movies & TV
+    229534,       # Software
+    300435,       # Software (GB)
+    301927,       # Software (DE)
+    412612031,    # Software (IT)
+    599376031,    # Software (ES)
+    976451031,    # Software (IN)
+    3198021,      # Software (CA)
+    9482690011,   # Software (MX)
+    4852502051,   # Software (AU)
+    917972,       # Movies & TV (CA)
+    976416031,    # Movies & TV Shows (IN)
+    4852264051,   # Movies & TV (AU)
     5174,         # CDs & Vinyl
     2238192011,   # Gift Cards
     16333372011,  # Amazon Devices & Accessories
@@ -117,7 +130,12 @@ def _load_categories_from_csv(csv_path: Path = _CATEGORY_CSV,
                 row = {k.strip(): v for k, v in row.items()}
                 cat_id = int(row["category_id"])
                 count = int(row.get("product_count") or 0)
-                if count >= min_products and cat_id not in _EXCLUDED_CATEGORY_IDS:
+                scope_decision = evaluate_seller_scope(
+                    category_name=" ".join(
+                        value for value in [row.get("category_en"), row.get("category_cn")] if value
+                    )
+                )
+                if count >= min_products and cat_id not in _EXCLUDED_CATEGORY_IDS and scope_decision.allowed:
                     rows.append((cat_id, count))
             # 按 product_count 降序
             rows.sort(key=lambda x: x[1], reverse=True)
@@ -392,6 +410,25 @@ class AutoCollector:
             logger.warning(f"读取补池任务失败: {e}")
             return
         if job is None:
+            return
+
+        scope_decision = evaluate_seller_scope(
+            category_path=job.category_path,
+            query=job.product_query,
+        )
+        blocked_by_category_id = job.category_id in _EXCLUDED_CATEGORY_IDS if job.category_id is not None else False
+        if blocked_by_category_id:
+            message = f"seller_scope_blocked:excluded_category_id:{job.category_id}"
+            self.expansion_job_store.mark_failed(job_id=job.job_id, error_message=message)
+            logger.info(f"补池任务 {job.job_id} 超出中小跨境卖家经营范围, 已拦截: {message}")
+            return
+        if not scope_decision.allowed:
+            message = (
+                f"seller_scope_blocked:{scope_decision.reason_code}:"
+                f"{','.join(scope_decision.matched_terms)}"
+            )
+            self.expansion_job_store.mark_failed(job_id=job.job_id, error_message=message)
+            logger.info(f"补池任务 {job.job_id} 超出中小跨境卖家经营范围, 已拦截: {message}")
             return
 
         logger.info(
@@ -773,6 +810,19 @@ class AutoCollector:
         )
 
         next_cat = self.storage.get_next_category_for_bestseller(self.domain)
+        while next_cat is not None:
+            cat_id = int(next_cat["category_id"])
+            cat_name = next_cat.get("category_cn") or next_cat.get("category_en") or str(cat_id)
+            scope_decision = evaluate_seller_scope(category_name=cat_name)
+            if scope_decision.allowed:
+                break
+            self.storage.mark_category_bestseller_done(cat_id, self.domain, 0)
+            logger.info(
+                f"跳过超出中小跨境卖家经营范围的类目 {cat_id} ({cat_name}): "
+                f"{scope_decision.reason_code} {list(scope_decision.matched_terms)}"
+            )
+            next_cat = self.storage.get_next_category_for_bestseller(self.domain)
+
         if next_cat is None:
             logger.info("所有类目的 BestSeller 均已采集完成, 无新类目可发现")
             # 注册种子 ASIN (如果有)
@@ -781,7 +831,7 @@ class AutoCollector:
                 self._stats["asins_discovered"] = new_count
             return
 
-        cat_id = next_cat["category_id"]
+        cat_id = int(next_cat["category_id"])
         cat_name = next_cat.get("category_cn") or next_cat.get("category_en") or str(cat_id)
 
         # BestSeller API 消耗 50 token, 先检查余量
@@ -876,7 +926,14 @@ class AutoCollector:
             self._stats["errors"].append(f"bestseller_{cat_id}: {e}")
 
         # 1d. 关键词搜索 (Keepa 定义: 10 token / 结果页)
-        for term in self.search_terms:
+        scoped_terms, blocked_terms = filter_seller_scope_keywords(self.search_terms)
+        for blocked in blocked_terms:
+            logger.info(
+                f"跳过超出中小跨境卖家经营范围的搜索词: "
+                f"{blocked.reason_code} {list(blocked.matched_terms)}"
+            )
+
+        for term in scoped_terms:
             try:
                 token_info = self.collector.check_token_status()
                 decision = self.token_allocator.can_run(
@@ -1242,6 +1299,31 @@ class AutoCollector:
 
             category_id = int(candidate["category_id"])
             category_name = candidate.get("category_name") or str(category_id)
+            category_path = candidate.get("category_path")
+            scope_decision = evaluate_seller_scope(
+                category_path=category_path,
+                category_name=category_name,
+            )
+            if not scope_decision.allowed:
+                logger.info(
+                    f"跳过超出中小跨境卖家经营范围的 L2/L3/L4 类目 "
+                    f"{category_id} ({category_name}): {scope_decision.reason_code} "
+                    f"{list(scope_decision.matched_terms)}"
+                )
+                self.storage.record_discovery_expansion(
+                    expansion_type="category",
+                    domain=self.domain,
+                    target_key=str(category_id),
+                    target_label=str(category_name),
+                    priority_score=0,
+                    candidate_count=0,
+                    new_asin_count=0,
+                    notes=(
+                        f"seller_scope_blocked={scope_decision.reason_code};"
+                        f"matched_terms={','.join(scope_decision.matched_terms)}"
+                    ),
+                )
+                continue
             shortlist_score = float(candidate.get("shortlist_score") or 0)
             started_at = _utc_now_str()
             raw_path = None
@@ -1376,6 +1458,26 @@ class AutoCollector:
                 break
 
             keyword = str(candidate["keyword"])
+            scope_decision = evaluate_seller_scope(query=keyword, keywords=[keyword])
+            if not scope_decision.allowed:
+                logger.info(
+                    f"跳过超出中小跨境卖家经营范围的 keyword '{keyword}': "
+                    f"{scope_decision.reason_code} {list(scope_decision.matched_terms)}"
+                )
+                self.storage.record_discovery_expansion(
+                    expansion_type="keyword",
+                    domain=self.domain,
+                    target_key=keyword,
+                    target_label=keyword,
+                    priority_score=0,
+                    candidate_count=0,
+                    new_asin_count=0,
+                    notes=(
+                        f"seller_scope_blocked={scope_decision.reason_code};"
+                        f"matched_terms={','.join(scope_decision.matched_terms)}"
+                    ),
+                )
+                continue
             expand_priority = float(candidate.get("expand_priority") or 0)
             started_at = _utc_now_str()
             requested = 0

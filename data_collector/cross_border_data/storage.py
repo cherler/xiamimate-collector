@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 import json
 
+from .seller_scope import evaluate_seller_scope
+
 try:
     import duckdb
 except ImportError:
@@ -775,7 +777,12 @@ class DuckDBStorage:
                 cat_id = int(row["category_id"])
                 count = int(row.get("product_count") or 0)
 
-                if cat_id in excluded or count < min_products:
+                scope_decision = evaluate_seller_scope(
+                    category_name=" ".join(
+                        value for value in [row.get("category_en"), row.get("category_cn")] if value
+                    )
+                )
+                if cat_id in excluded or count < min_products or not scope_decision.allowed:
                     continue
 
                 order += 1

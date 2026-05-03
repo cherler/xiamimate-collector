@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 from .collectors.base import BaseCollector, CollectorError
+from .seller_scope import filter_seller_scope_keywords
 from .utils import utc_now_text
 
 
@@ -334,6 +335,7 @@ def extract_keywords_from_title(
     if remaining > 0:
         result.extend(single_word[:remaining])
 
+    result, _blocked = filter_seller_scope_keywords(result)
     return result
 
 
