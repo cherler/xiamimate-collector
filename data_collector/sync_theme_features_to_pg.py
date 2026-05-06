@@ -71,7 +71,12 @@ DEFAULT_LOCK_PATH = _resolve_configured_path(
 DEFAULT_RETENTION_DAYS = max(30, int(os.environ.get("THEME_FEATURE_RETENTION_DAYS", "180")))
 DEFAULT_OVERLAP_DAYS = max(7, int(os.environ.get("THEME_FEATURE_REFRESH_OVERLAP_DAYS", "35")))
 DEFAULT_DUCKDB_THREADS = max(1, int(os.environ.get("THEME_FEATURE_DUCKDB_THREADS", "4")))
+THEME_FEATURE_DUCKDB_READ_MODE = os.environ.get("THEME_FEATURE_DUCKDB_READ_MODE", "direct").strip().lower()
+THEME_FEATURE_DUCKDB_COPY_DIR = os.environ.get("THEME_FEATURE_DUCKDB_COPY_DIR", "").strip()
+THEME_FEATURE_TARGET_ASINS = os.environ.get("THEME_FEATURE_TARGET_ASINS", "").strip()
+THEME_FEATURE_TARGET_DOMAINS = os.environ.get("THEME_FEATURE_TARGET_DOMAINS", "").strip()
 SERVING_LOOKBACK_DAYS = 7
+_SYNC_COPY_DIRS: list[Path] = []
 
 FEATURE_TABLES = {
     "base": {
@@ -180,7 +185,8 @@ WITH history_enriched AS (
     FROM curated.keepa_product_history h
     LEFT JOIN curated.keepa_asin_registry r
         ON h.asin = r.asin AND h.domain = r.domain
-    WHERE h.date >= DATE '{history_start_date}'
+        WHERE h.date >= DATE '{history_start_date}'
+            {target_history_filter}
     WINDOW history_window AS (
         PARTITION BY h.asin, h.domain
         ORDER BY h.date
@@ -236,7 +242,8 @@ WHERE date >= DATE '{source_start_date}'
 THEME_TRENDS_SOURCE_SQL = """
 WITH keyword_totals AS (
     SELECT asin, domain, COUNT(DISTINCT keyword) AS total_keywords
-    FROM curated.asin_keyword_mapping
+    FROM curated.asin_keyword_mapping m
+    {target_keyword_where}
     GROUP BY 1, 2
 ),
 trend_daily AS (
@@ -251,6 +258,7 @@ trend_daily AS (
         ON m.keyword = t.keyword
        AND m.geo = t.geo
     WHERE t.date >= DATE '{source_start_date}'
+            {target_keyword_filter}
     GROUP BY 1, 2, 3
 ),
 aligned AS (
@@ -350,21 +358,60 @@ def ensure_pg_schema(pg_conn) -> None:
     pg_conn.commit()
 
 
-def get_duckdb_conn(db_path: str | Path) -> duckdb.DuckDBPyConnection:
-    """Open a DuckDB snapshot copy so feature sync doesn't contend with writers."""
-    src = Path(db_path).resolve()
-    tmp_dir = Path(tempfile.gettempdir()) / "xiamimate_theme_feature_sync"
-    tmp_dir.mkdir(exist_ok=True)
+def _copy_duckdb_for_sync(src: Path) -> tuple[Path, Path]:
+    base_dir = Path(THEME_FEATURE_DUCKDB_COPY_DIR).expanduser() if THEME_FEATURE_DUCKDB_COPY_DIR else Path(tempfile.gettempdir()) / "xiamimate_theme_feature_sync"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="run_", dir=base_dir))
     tmp_path = tmp_dir / src.name
+
     shutil.copy2(src, tmp_path)
-    wal = src.with_suffix(".duckdb.wal")
+    wal = Path(f"{src}.wal")
     if wal.exists():
         shutil.copy2(wal, tmp_dir / wal.name)
-    try:
-        conn = duckdb.connect(str(tmp_path), read_only=True)
-    except Exception as exc:
-        logger.warning("打开 DuckDB 临时快照失败，将回退到源库只读连接: %s", exc)
+
+    return tmp_path, tmp_dir
+
+
+def get_duckdb_conn(db_path: str | Path) -> duckdb.DuckDBPyConnection:
+    """Open DuckDB for theme sync. Default mode reads a temporary copy to avoid live writer locks."""
+    src = Path(db_path).resolve()
+    retries = max(1, int(os.environ.get("DUCKDB_OPEN_RETRIES", "6")))
+    base_delay = max(0.2, float(os.environ.get("DUCKDB_OPEN_RETRY_DELAY_SECONDS", "1.0")))
+    use_copy = THEME_FEATURE_DUCKDB_READ_MODE not in {"live", "direct"}
+
+    conn = None
+    for attempt in range(1, retries + 1):
+        copy_dir: Path | None = None
+        try:
+            db_to_open = src
+            if use_copy:
+                db_to_open, copy_dir = _copy_duckdb_for_sync(src)
+                logger.info("DuckDB theme sync copy prepared: %s", db_to_open)
+
+            conn = duckdb.connect(str(db_to_open), read_only=True)
+            if copy_dir is not None:
+                _SYNC_COPY_DIRS.append(copy_dir)
+            break
+        except Exception as exc:
+            if copy_dir is not None:
+                shutil.rmtree(copy_dir, ignore_errors=True)
+            if attempt >= retries:
+                raise
+            wait_seconds = min(base_delay * (2 ** (attempt - 1)), 12.0)
+            logger.warning(
+                "DuckDB 连接失败(第 %d/%d 次)，%.1fs 后重试: %s",
+                attempt,
+                retries,
+                wait_seconds,
+                exc,
+            )
+            time.sleep(wait_seconds)
+
+    if conn is None:
         conn = duckdb.connect(str(src), read_only=True)
+
+    tmp_dir = Path(tempfile.gettempdir()) / "xiamimate_theme_feature_sync"
+    tmp_dir.mkdir(exist_ok=True)
     conn.execute("SET preserve_insertion_order = false")
     conn.execute(f"SET threads TO {DEFAULT_DUCKDB_THREADS}")
     conn.execute(f"SET temp_directory = '{tmp_dir.as_posix()}'")
@@ -430,12 +477,71 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _parse_csv_values(raw_value: str) -> list[str]:
+    if not raw_value:
+        return []
+    values = []
+    seen = set()
+    for item in raw_value.split(","):
+        value = item.strip()
+        if not value or value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    return values
+
+
+def _parse_domain_values(raw_value: str) -> list[int]:
+    domains = []
+    for value in _parse_csv_values(raw_value):
+        try:
+            domains.append(int(value))
+        except ValueError as exc:
+            raise ValueError(f"invalid THEME_FEATURE_TARGET_DOMAINS value: {value}") from exc
+    return domains
+
+
+def _sql_in_list(values: list[str]) -> str:
+    return ", ".join(_sql_literal(value) for value in values)
+
+
+def _target_condition(alias: str, target_asins: list[str], target_domains: list[int]) -> str:
+    conditions = []
+    if target_asins:
+        conditions.append(f"{alias}.asin IN ({_sql_in_list(target_asins)})")
+    if target_domains:
+        conditions.append(f"{alias}.domain IN ({', '.join(str(domain) for domain in target_domains)})")
+    return " AND ".join(conditions)
+
+
+def _target_pg_where(target_asins: list[str], target_domains: list[int]) -> tuple[str, list[object]]:
+    clauses = []
+    params: list[object] = []
+    if target_asins:
+        clauses.append("asin = ANY(%s)")
+        params.append(target_asins)
+    if target_domains:
+        clauses.append("domain = ANY(%s)")
+        params.append(target_domains)
+    if not clauses:
+        return "", []
+    return " AND " + " AND ".join(clauses), params
+
+
 def build_serving_feature_tables(
     duck: duckdb.DuckDBPyConnection,
     *,
     build_source_start,
     build_history_start,
+    target_asins: list[str],
+    target_domains: list[int],
 ) -> None:
+    target_history_condition = _target_condition("h", target_asins, target_domains)
+    target_keyword_condition = _target_condition("m", target_asins, target_domains)
+    target_history_filter = f"AND {target_history_condition}" if target_history_condition else ""
+    target_keyword_filter = f"AND {target_keyword_condition}" if target_keyword_condition else ""
+    target_keyword_where = f"WHERE {target_keyword_condition}" if target_keyword_condition else ""
+
     logger.info(
         "构建 DuckDB serving 基础特征临时表 (history_start=%s, source_start=%s)",
         build_history_start,
@@ -449,6 +555,7 @@ def build_serving_feature_tables(
             domain_multiplier_case=_domain_multiplier_case(),
             coeff_a_case=_category_coeff_case("coeff_a"),
             coeff_b_case=_category_coeff_case("coeff_b"),
+            target_history_filter=target_history_filter,
         )
     )
     logger.info("DuckDB serving 基础特征临时表构建完成")
@@ -456,7 +563,11 @@ def build_serving_feature_tables(
     logger.info("构建 DuckDB serving 趋势特征临时表 (source_start=%s)", build_source_start)
     duck.execute(
         "CREATE OR REPLACE TEMP TABLE theme_sync_trends_daily AS "
-        + THEME_TRENDS_SOURCE_SQL.format(source_start_date=build_source_start.isoformat())
+        + THEME_TRENDS_SOURCE_SQL.format(
+            source_start_date=build_source_start.isoformat(),
+            target_keyword_where=target_keyword_where,
+            target_keyword_filter=target_keyword_filter,
+        )
     )
     logger.info("DuckDB serving 趋势特征临时表构建完成")
 
@@ -494,6 +605,8 @@ def sync_feature_table(
     retention_days: int,
     full: bool,
     refresh_start,
+    target_asins: list[str],
+    target_domains: list[int],
 ) -> int:
     pg_table = config["pg_table"]
     source_table = config["source_table"]
@@ -526,9 +639,17 @@ def sync_feature_table(
             copied_rows = int(cur.fetchone()[0])
 
             if full:
-                cur.execute(f"TRUNCATE TABLE {pg_table}")
+                if target_asins or target_domains:
+                    target_where, target_params = _target_pg_where(target_asins, target_domains)
+                    cur.execute(f"DELETE FROM {pg_table} WHERE TRUE {target_where}", target_params)
+                else:
+                    cur.execute(f"TRUNCATE TABLE {pg_table}")
             else:
-                cur.execute(f"DELETE FROM {pg_table} WHERE date >= %s", [refresh_start])
+                target_where, target_params = _target_pg_where(target_asins, target_domains)
+                cur.execute(
+                    f"DELETE FROM {pg_table} WHERE date >= %s {target_where}",
+                    [refresh_start, *target_params],
+                )
 
             cur.execute(
                 f"INSERT INTO {pg_table} ({column_list_sql}) SELECT {column_list_sql} FROM {temp_table_name}"
@@ -581,6 +702,14 @@ def run_sync(
     )
     started_at = time.time()
     results: dict[str, int] = {}
+    target_asins = _parse_csv_values(THEME_FEATURE_TARGET_ASINS)
+    target_domains = _parse_domain_values(THEME_FEATURE_TARGET_DOMAINS)
+    if target_asins or target_domains:
+        logger.info(
+            "主题特征目标刷新 — asins=%s domains=%s",
+            len(target_asins) if target_asins else "all",
+            target_domains if target_domains else "all",
+        )
 
     duck = get_duckdb_conn(duckdb_path)
     pg_conn = get_pg_conn()
@@ -604,6 +733,8 @@ def run_sync(
             duck,
             build_source_start=refresh_plan["build_source_start"],
             build_history_start=refresh_plan["build_history_start"],
+            target_asins=target_asins,
+            target_domains=target_domains,
         )
         for table_name in table_names:
             try:
@@ -615,12 +746,16 @@ def run_sync(
                     retention_days=retention_days,
                     full=full,
                     refresh_start=refresh_plan["refresh_starts"][table_name],
+                    target_asins=target_asins,
+                    target_domains=target_domains,
                 )
             except Exception as exc:
                 logger.error("  同步 %s 失败: %s", table_name, exc)
                 results[table_name] = -1
     finally:
         duck.close()
+        while _SYNC_COPY_DIRS:
+            shutil.rmtree(_SYNC_COPY_DIRS.pop(), ignore_errors=True)
         pg_conn.close()
 
     elapsed = round(time.time() - started_at, 1)

@@ -68,6 +68,21 @@ Phase 2 已补齐：
 2. `bash scripts/manage_pg_sync.sh {install|start|stop|restart|status|uninstall|logs}`
 3. `bash scripts/manage_theme_sync.sh {install|start|stop|restart|status|uninstall|logs}`
 
+ECS2 systemd 入口：
+
+1. 复制 `data_collector/.env.ecs2.example` 为 ECS2 上的 `data_collector/.env`，填入实际 Python、DuckDB、raw、日志和 PostgreSQL 目标配置。
+2. 只读核对：`bash scripts/dry_run_validate_collector.sh`
+3. 命令预览：
+   - `bash scripts/manage_auto_collect.sh preview`
+   - `bash scripts/run_pg_sync_once.sh`
+   - `bash scripts/run_theme_feature_sync_once.sh`
+4. 安装 systemd：`sudo bash scripts/manage_ecs2_collector_services.sh install all`
+5. 查看状态：`sudo bash scripts/manage_ecs2_collector_services.sh status all`
+6. 查看日志：
+   - `sudo bash scripts/manage_ecs2_collector_services.sh logs auto`
+   - `sudo bash scripts/manage_ecs2_collector_services.sh logs pg-sync`
+   - `sudo bash scripts/manage_ecs2_collector_services.sh logs theme-sync`
+
 统一管理入口：
 
 1. 推荐优先使用 `bash scripts/manage_collector_jobs.sh help`
@@ -98,6 +113,16 @@ RDS cutover 说明：
 5. 如果要改成系统托管，优先执行：
    - `bash scripts/manage_pg_sync.sh install`
    - `bash scripts/manage_theme_sync.sh install`
+
+ECS2 cutover 说明：
+
+1. ECS2 不再依赖 macOS `launchd`，改用 `scripts/manage_ecs2_collector_services.sh` 生成并托管：
+   - `xiamimate-auto-collect.service`
+   - `xiamimate-pg-sync.service`
+   - `xiamimate-theme-sync.service`
+2. `auto-collect` 通过 `scripts/run_auto_collect_foreground.sh` 以前台方式交给 systemd 托管；崩溃后由 systemd 重启。
+3. `pg-sync` 与 `theme-sync` 通过 `scripts/run_pg_sync_loop.sh`、`scripts/run_theme_sync_loop.sh` 按“单次执行 + sleep”循环运行，沿用现有 `run_*_once.sh` 的业务入口，不重写同步逻辑。
+4. ECS2 推荐直接写 PostgreSQL 目标库，默认 `PG_TUNNEL_ENABLED=0`；只有 ECS2 到目标库仍然不通时，才再切回 SSH 隧道模式。
 
 SSH 隧道同步模式：
 

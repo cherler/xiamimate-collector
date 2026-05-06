@@ -421,6 +421,10 @@ class DuckDBStorage:
             self._conn.close()
             self._conn = None
 
+    def checkpoint(self) -> None:
+        if self._conn is not None:
+            self._conn.execute("CHECKPOINT")
+
     def __enter__(self):
         return self
 

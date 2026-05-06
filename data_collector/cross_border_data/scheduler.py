@@ -22,10 +22,12 @@ token 预算说明 (21 token/min 套餐):
 from __future__ import annotations
 
 import csv
+import fcntl
 import gzip
 import json
 import logging
 import os
+from contextlib import contextmanager
 import signal
 import sys
 import time
@@ -55,6 +57,42 @@ logger = logging.getLogger(__name__)
 
 def _utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+@contextmanager
+def _duckdb_access_lock():
+    lock_path_raw = os.environ.get("XIAMIMATE_DUCKDB_ACCESS_LOCK_FILE", "").strip()
+    if not lock_path_raw:
+        yield
+        return
+
+    lock_path = Path(lock_path_raw).expanduser()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    timeout_seconds = max(0, int(os.environ.get("XIAMIMATE_DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS", "900") or "0"))
+    started_at = time.time()
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"pid={os.getpid()}\nrole=auto_collect\nacquired_at={_utc_now_str()}\n")
+                handle.flush()
+                break
+            except BlockingIOError:
+                if timeout_seconds and time.time() - started_at >= timeout_seconds:
+                    raise TimeoutError(f"等待 DuckDB access lock 超时: {lock_path}")
+                time.sleep(2)
+
+        try:
+            yield
+        finally:
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.flush()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +250,17 @@ class AutoCollector:
         self.strategy_keyword_limit = strategy_keyword_limit
         self.strategy_category_cooldown_hours = strategy_category_cooldown_hours
         self.strategy_keyword_cooldown_hours = strategy_keyword_cooldown_hours
+        try:
+            self.business_priority_refresh_interval_seconds = max(
+                0,
+                int(os.environ.get("AUTO_BUSINESS_PRIORITY_REFRESH_INTERVAL_SECONDS", "21600") or "0"),
+            )
+        except ValueError:
+            self.business_priority_refresh_interval_seconds = 21600
+        self.business_priority_refresh_state_file = (
+            Path(os.environ.get("XIAMIMATE_LOG_DIR", "logs")).expanduser()
+            / f"business_priority_refresh_domain_{self.domain}.state"
+        )
         self.seed_file = seed_file
         self.categories = categories or _load_categories_for_domain(domain)
         self.search_terms = search_terms or []
@@ -1197,6 +1246,13 @@ class AutoCollector:
                 except Exception as e:
                     logger.warning(f"写入批次日志失败: {e}")
 
+                try:
+                    checkpoint_start = time.time()
+                    self.storage.checkpoint()
+                    logger.info(f"  DuckDB checkpoint 完成 ({time.time() - checkpoint_start:.1f}s)")
+                except Exception as e:
+                    logger.warning(f"DuckDB checkpoint 失败: {e}")
+
             except Exception as e:
                 consecutive_errors += 1
                 logger.error(f"采集 {asin_list[:3]}... 失败 ({consecutive_errors}/{max_consecutive_errors}): {e}")
@@ -1212,6 +1268,21 @@ class AutoCollector:
     def _refresh_business_priorities(self) -> None:
         logger.info("--- Phase 2.5: 刷新业务评分与调度优先级 ---")
         try:
+            interval_seconds = self.business_priority_refresh_interval_seconds
+            if interval_seconds > 0:
+                age_seconds = None
+                try:
+                    age_seconds = time.time() - self.business_priority_refresh_state_file.stat().st_mtime
+                except FileNotFoundError:
+                    age_seconds = None
+                if age_seconds is not None and age_seconds < interval_seconds:
+                    wait_seconds = max(0, interval_seconds - int(age_seconds))
+                    logger.info(
+                        f"业务评分跳过: 距上次刷新 {int(age_seconds)}s, "
+                        f"未达到最小间隔 {interval_seconds}s, 约 {wait_seconds}s 后可刷新"
+                    )
+                    return
+
             result = refresh_domain_business_priorities(
                 self.storage,
                 domain=self.domain,
@@ -1222,6 +1293,9 @@ class AutoCollector:
                 f"业务评分已刷新: {self._stats['business_scores_updated']} 个 ASIN, "
                 f"分层 {self._stats['business_tier_stats']}"
             )
+            if interval_seconds > 0:
+                self.business_priority_refresh_state_file.parent.mkdir(parents=True, exist_ok=True)
+                self.business_priority_refresh_state_file.write_text(_utc_now_str() + "\n", encoding="utf-8")
         except Exception as e:
             logger.warning(f"刷新业务评分失败: {e}")
             self._stats["errors"].append(f"business_score: {e}")
@@ -1925,26 +1999,30 @@ def run_auto_collect(
 ) -> dict[str, Any]:
     """启动一次自动采集, 供 CLI 调用."""
 
-    collector = AutoCollector(
-        keepa_api_key=keepa_api_key,
-        keepa_base_url=keepa_base_url,
-        db_path=db_path,
-        domain=domain,
-        categories=categories,
-        search_terms=search_terms,
-        seed_file=seed_file,
-        enable_google_trends=enable_google_trends,
-        enable_strategy_expansion=enable_strategy_expansion,
-        strategy_pending_threshold=strategy_pending_threshold,
-        strategy_category_limit=strategy_category_limit,
-        strategy_keyword_limit=strategy_keyword_limit,
-        strategy_category_cooldown_hours=strategy_category_cooldown_hours,
-        strategy_keyword_cooldown_hours=strategy_keyword_cooldown_hours,
-        stale_hours=stale_hours,
-        batch_size=batch_size,
-    )
+    with _duckdb_access_lock():
+        collector = AutoCollector(
+            keepa_api_key=keepa_api_key,
+            keepa_base_url=keepa_base_url,
+            db_path=db_path,
+            domain=domain,
+            categories=categories,
+            search_terms=search_terms,
+            seed_file=seed_file,
+            enable_google_trends=enable_google_trends,
+            enable_strategy_expansion=enable_strategy_expansion,
+            strategy_pending_threshold=strategy_pending_threshold,
+            strategy_category_limit=strategy_category_limit,
+            strategy_keyword_limit=strategy_keyword_limit,
+            strategy_category_cooldown_hours=strategy_category_cooldown_hours,
+            strategy_keyword_cooldown_hours=strategy_keyword_cooldown_hours,
+            stale_hours=stale_hours,
+            batch_size=batch_size,
+        )
 
-    return collector.run()
+        try:
+            return collector.run()
+        finally:
+            collector.storage.close()
 
 
 def run_auto_collect_loop(

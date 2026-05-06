@@ -87,6 +87,10 @@ PG_SYNC_FETCH_BATCH_SIZE = max(
     PG_SYNC_BATCH_SIZE,
     int(os.environ.get("PG_SYNC_FETCH_BATCH_SIZE", "10000")),
 )
+PG_SYNC_DUCKDB_THREADS = max(1, int(os.environ.get("PG_SYNC_DUCKDB_THREADS", "1")))
+PG_SYNC_DUCKDB_MEMORY_LIMIT = os.environ.get("PG_SYNC_DUCKDB_MEMORY_LIMIT", "1536MB")
+PG_SYNC_DUCKDB_READ_MODE = os.environ.get("PG_SYNC_DUCKDB_READ_MODE", "direct").strip().lower()
+PG_SYNC_DUCKDB_COPY_DIR = os.environ.get("PG_SYNC_DUCKDB_COPY_DIR", "").strip()
 PG_AGG_REFRESH_INTERVAL_SECONDS = max(
     300, int(os.environ.get("PG_AGG_REFRESH_INTERVAL_SECONDS", "3600"))
 )
@@ -100,8 +104,9 @@ THEME_SYNC_TRIGGER_TIMEOUT_SECONDS = max(
 )
 THEME_SYNC_TRIGGER_SCRIPT = _resolve_configured_path(
     "PG_SYNC_TRIGGER_THEME_SYNC_SCRIPT",
-    PROJECT_ROOT / "scripts" / "run_theme_feature_sync_once.sh",
+    PROJECT_ROOT / "scripts" / "run_candidate_expansion_refresh_once.sh",
 )
+_SYNC_COPY_DIRS: list[Path] = []
 
 HISTORY_DOMAIN_DAILY_SQL = f"""
 SELECT
@@ -264,24 +269,80 @@ def ensure_pg_sync_schema(pg_conn) -> None:
     pg_conn.commit()
 
 
-def get_duckdb_conn(db_path: str | Path) -> duckdb.DuckDBPyConnection:
-    """拷贝 DuckDB 文件后以只读方式打开 (避免与 auto_collect 冲突)."""
-    src = Path(db_path)
-    tmp_dir = Path(tempfile.gettempdir()) / "xiamimate_sync"
-    tmp_dir.mkdir(exist_ok=True)
+def _configure_duckdb_conn(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
+    conn.execute(f"SET threads TO {PG_SYNC_DUCKDB_THREADS}")
+    conn.execute(f"SET memory_limit = '{PG_SYNC_DUCKDB_MEMORY_LIMIT}'")
+    conn.execute("SET preserve_insertion_order = false")
+    return conn
+
+
+def _copy_duckdb_for_sync(src: Path) -> tuple[Path, Path]:
+    base_dir = Path(PG_SYNC_DUCKDB_COPY_DIR).expanduser() if PG_SYNC_DUCKDB_COPY_DIR else Path(tempfile.gettempdir()) / "xiamimate_pg_sync"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="run_", dir=base_dir))
     tmp_path = tmp_dir / src.name
-    # 拷贝主文件 + WAL (如果存在), 保证包含最新未 checkpoint 数据
+
     shutil.copy2(src, tmp_path)
-    wal = src.with_suffix(".duckdb.wal")
+    wal = Path(f"{src}.wal")
     if wal.exists():
         shutil.copy2(wal, tmp_dir / wal.name)
-    try:
-        return duckdb.connect(str(tmp_path), read_only=True)
-    except Exception as exc:
-        logger.warning(
-            "打开 DuckDB 临时快照失败，将回退到源库只读连接: %s", exc
-        )
-        return duckdb.connect(str(src), read_only=True)
+
+    return tmp_path, tmp_dir
+
+
+def get_duckdb_conn(db_path: str | Path) -> duckdb.DuckDBPyConnection:
+    """Open DuckDB for sync. Default mode reads a temporary copy to avoid live writer locks."""
+    src = Path(db_path).resolve()
+    retries = max(1, int(os.environ.get("DUCKDB_OPEN_RETRIES", "6")))
+    base_delay = max(0.2, float(os.environ.get("DUCKDB_OPEN_RETRY_DELAY_SECONDS", "1.0")))
+    use_copy = PG_SYNC_DUCKDB_READ_MODE not in {"live", "direct"}
+
+    for attempt in range(1, retries + 1):
+        copy_dir: Path | None = None
+        try:
+            db_to_open = src
+            if use_copy:
+                db_to_open, copy_dir = _copy_duckdb_for_sync(src)
+                logger.info("DuckDB sync copy prepared: %s", db_to_open)
+
+            conn = duckdb.connect(str(db_to_open), read_only=True)
+            if copy_dir is not None:
+                _SYNC_COPY_DIRS.append(copy_dir)
+            return _configure_duckdb_conn(conn)
+        except Exception as exc:
+            if copy_dir is not None:
+                shutil.rmtree(copy_dir, ignore_errors=True)
+            if attempt >= retries:
+                raise
+            wait_seconds = min(base_delay * (2 ** (attempt - 1)), 12.0)
+            logger.warning(
+                "DuckDB 连接失败(第 %d/%d 次)，%.1fs 后重试: %s",
+                attempt,
+                retries,
+                wait_seconds,
+                exc,
+            )
+            time.sleep(wait_seconds)
+
+    # 不可达，保留以满足静态检查器
+    return _configure_duckdb_conn(duckdb.connect(str(src), read_only=True))
+
+
+def _parse_table_filter(env_name: str) -> set[str]:
+    configured = os.environ.get(env_name, "").strip()
+    if not configured:
+        return set()
+    return {item.strip() for item in configured.split(",") if item.strip()}
+
+
+def _table_selected(duck_table: str, pg_table: str) -> bool:
+    includes = _parse_table_filter("PG_SYNC_TABLES")
+    excludes = _parse_table_filter("PG_SYNC_SKIP_TABLES")
+    if includes and duck_table not in includes and pg_table not in includes:
+        return False
+    if duck_table in excludes or pg_table in excludes:
+        return False
+    return True
 
 
 def _get_pg_max_timestamp(pg_conn, pg_table: str, ts_col: str):
@@ -584,7 +645,7 @@ def sync_table(
     return total_rows
 
 
-def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
+def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> list[str]:
     """Mark expansion jobs completed only after discovered ASINs are synced and fetched."""
     with pg_conn.cursor() as cur:
         cur.execute(
@@ -595,6 +656,8 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                     CARDINALITY(COALESCE(j.result_candidate_asins, ARRAY[]::TEXT[])) AS expected_asin_count,
                     COUNT(DISTINCT r.asin) AS synced_asin_count,
                     COUNT(DISTINCT r.asin) FILTER (WHERE r.last_fetched_at IS NOT NULL) AS fetched_asin_count,
+                    COUNT(DISTINCT r.asin) FILTER (WHERE r.is_active IS FALSE) AS inactive_asin_count,
+                    COUNT(DISTINCT r.asin) FILTER (WHERE r.last_fetched_at IS NOT NULL OR r.is_active IS FALSE) AS terminal_asin_count,
                     COUNT(DISTINCT s.asin) AS snapshot_hit_count,
                     COUNT(DISTINCT h.asin) AS history_hit_count
                 FROM sync.keepa_candidate_expansion_jobs j
@@ -611,12 +674,12 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                 GROUP BY j.job_id, j.result_candidate_asins
             ),
             incomplete_hydration_jobs AS (
-                SELECT job_id, expected_asin_count, synced_asin_count, fetched_asin_count,
-                       snapshot_hit_count, history_hit_count
+                                SELECT job_id, expected_asin_count, synced_asin_count, fetched_asin_count,
+                                             inactive_asin_count, terminal_asin_count, snapshot_hit_count, history_hit_count
                 FROM progress
                 WHERE expected_asin_count > 0
                   AND synced_asin_count >= expected_asin_count
-                  AND fetched_asin_count < expected_asin_count
+                                    AND terminal_asin_count < expected_asin_count
             )
             UPDATE sync.keepa_candidate_expansion_jobs j
             SET status = 'hydrating',
@@ -628,6 +691,8 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                         'pg_expected_asin_count', incomplete_hydration_jobs.expected_asin_count,
                         'pg_synced_asin_count', incomplete_hydration_jobs.synced_asin_count,
                         'pg_fetched_asin_count', incomplete_hydration_jobs.fetched_asin_count,
+                        'pg_inactive_asin_count', incomplete_hydration_jobs.inactive_asin_count,
+                        'pg_terminal_asin_count', incomplete_hydration_jobs.terminal_asin_count,
                         'pg_snapshot_hit_count', incomplete_hydration_jobs.snapshot_hit_count,
                         'pg_history_hit_count', incomplete_hydration_jobs.history_hit_count,
                         'hydration_requeued_at', NOW()
@@ -646,7 +711,9 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                     j.job_id,
                     CARDINALITY(COALESCE(j.result_candidate_asins, ARRAY[]::TEXT[])) AS expected_asin_count,
                     COUNT(DISTINCT r.asin) AS synced_asin_count,
-                    COUNT(DISTINCT r.asin) FILTER (WHERE r.last_fetched_at IS NOT NULL) AS fetched_asin_count
+                    COUNT(DISTINCT r.asin) FILTER (WHERE r.last_fetched_at IS NOT NULL) AS fetched_asin_count,
+                    COUNT(DISTINCT r.asin) FILTER (WHERE r.is_active IS FALSE) AS inactive_asin_count,
+                    COUNT(DISTINCT r.asin) FILTER (WHERE r.last_fetched_at IS NOT NULL OR r.is_active IS FALSE) AS terminal_asin_count
                 FROM sync.keepa_candidate_expansion_jobs j
                 LEFT JOIN sync.keepa_asin_registry r
                   ON r.domain = j.domain
@@ -655,10 +722,13 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                 GROUP BY j.job_id, j.result_candidate_asins
             ),
             ready_jobs AS (
-                SELECT job_id, expected_asin_count, synced_asin_count
+                SELECT job_id, expected_asin_count, synced_asin_count, fetched_asin_count, inactive_asin_count, terminal_asin_count
                 FROM progress
                 WHERE expected_asin_count = 0
-                   OR (synced_asin_count >= expected_asin_count AND fetched_asin_count >= expected_asin_count)
+                   OR (
+                       synced_asin_count >= expected_asin_count
+                       AND terminal_asin_count >= expected_asin_count
+                   )
             )
             UPDATE sync.keepa_candidate_expansion_jobs j
             SET status = 'completed',
@@ -672,6 +742,9 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
                     || jsonb_build_object(
                         'pg_expected_asin_count', ready_jobs.expected_asin_count,
                         'pg_synced_asin_count', ready_jobs.synced_asin_count,
+                        'pg_fetched_asin_count', ready_jobs.fetched_asin_count,
+                        'pg_inactive_asin_count', ready_jobs.inactive_asin_count,
+                        'pg_terminal_asin_count', ready_jobs.terminal_asin_count,
                         'sync_reconciled_at', NOW()
                     )
             FROM ready_jobs
@@ -686,14 +759,16 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> int:
     if requeued_count:
         logger.info("  expansion jobs: requeued %s jobs for incomplete hydration", requeued_count)
 
-    completed_count = len(completed)
+    completed_job_ids = [str(row[0]) for row in completed]
+    completed_count = len(completed_job_ids)
     if completed_count:
         logger.info("  expansion jobs: marked %s syncing jobs as completed", completed_count)
-    return completed_count
+    return completed_job_ids
 
 
-def _trigger_theme_sync_after_expansion_reconcile(completed_count: int) -> bool:
+def _trigger_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) -> bool:
     """Run theme feature sync after expansion jobs become completed."""
+    completed_count = len(completed_job_ids)
     if completed_count <= 0:
         return False
     if not TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE:
@@ -716,6 +791,13 @@ def _trigger_theme_sync_after_expansion_reconcile(completed_count: int) -> bool:
             cwd=str(PROJECT_ROOT),
             check=True,
             timeout=THEME_SYNC_TRIGGER_TIMEOUT_SECONDS,
+            env={
+                **os.environ,
+                "PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE": "false",
+                "CANDIDATE_EXPANSION_JOB_IDS": ",".join(completed_job_ids),
+                "CANDIDATE_EXPANSION_DUCKDB_SOURCE": "snapshot",
+                "CANDIDATE_EXPANSION_REFRESH_SNAPSHOT": "false",
+            },
         )
     except subprocess.TimeoutExpired:
         logger.warning(
@@ -736,7 +818,7 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
     logger.info(f"{'全量' if full else '增量'}同步开始 — DuckDB: {duckdb_path}")
     start = time.time()
     results = {}
-    reconciled_expansion_jobs = 0
+    reconciled_expansion_job_ids: list[str] = []
     sync_state = _load_sync_state(state_path)
 
     duck = get_duckdb_conn(duckdb_path)
@@ -746,6 +828,15 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
         ensure_pg_sync_schema(pg_conn)
         for duck_table, config in SYNC_TABLES.items():
             try:
+                if not _table_selected(duck_table, config["pg_table"]):
+                    logger.info(
+                        "  %s → %s: skipped by PG_SYNC_TABLES/PG_SYNC_SKIP_TABLES",
+                        duck_table,
+                        config["pg_table"],
+                    )
+                    results[duck_table] = 0
+                    continue
+
                 if _should_skip_table(config, full=full, sync_state=sync_state):
                     interval_seconds = int(config.get("min_sync_interval_seconds", 0) or 0)
                     logger.info(
@@ -765,20 +856,23 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
                 pg_conn.rollback()
                 results[duck_table] = -1
         try:
-            reconciled_expansion_jobs = _reconcile_candidate_expansion_jobs_completion(pg_conn)
-            results["sync.keepa_candidate_expansion_jobs:reconciled"] = reconciled_expansion_jobs
+            reconciled_expansion_job_ids = _reconcile_candidate_expansion_jobs_completion(pg_conn)
+            results["sync.keepa_candidate_expansion_jobs:reconciled"] = len(reconciled_expansion_job_ids)
         except Exception as e:
             logger.warning("  expansion jobs 状态协调失败: %s", e)
             pg_conn.rollback()
+            reconciled_expansion_job_ids = []
             results["sync.keepa_candidate_expansion_jobs:reconciled"] = -1
     finally:
         duck.close()
+        while _SYNC_COPY_DIRS:
+            shutil.rmtree(_SYNC_COPY_DIRS.pop(), ignore_errors=True)
         pg_conn.close()
 
     _save_sync_state(state_path, sync_state)
 
     results["serving.theme_feature_sync:triggered"] = int(
-        _trigger_theme_sync_after_expansion_reconcile(reconciled_expansion_jobs)
+        _trigger_theme_sync_after_expansion_reconcile(reconciled_expansion_job_ids)
     )
 
     elapsed = round(time.time() - start, 1)

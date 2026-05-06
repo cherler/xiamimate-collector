@@ -30,6 +30,10 @@ set_default_if_missing() {
 }
 
 COLLECTOR_ENV_OVERRIDE_NAMES=(
+    PG_SYNC_TABLES
+    PG_SYNC_SKIP_TABLES
+    PG_SYNC_REFRESH_SNAPSHOT
+    PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE
     PG_TUNNEL_LOCAL_HOST
     PG_TUNNEL_LOCAL_PORT
     PG_TUNNEL_PID_FILE
@@ -123,13 +127,17 @@ fi
 if [[ -n "${XIAMIMATE_RUNTIME_ROOT:-}" ]]; then
     set_default_if_missing "XIAMIMATE_PYTHON_BIN" "$XIAMIMATE_RUNTIME_ROOT/python/.venv/bin/python"
     set_default_if_missing "XIAMIMATE_DUCKDB_PATH" "$XIAMIMATE_RUNTIME_ROOT/duckdb/warehouse/local_analytics.duckdb"
+    set_default_if_missing "XIAMIMATE_RAW_JSON_ROOT" "$XIAMIMATE_RUNTIME_ROOT/raw/json"
     set_default_if_missing "XIAMIMATE_RAW_PRODUCTS_DIR" "$XIAMIMATE_RUNTIME_ROOT/raw/json/products"
+    set_default_if_missing "XIAMIMATE_RAW_BESTSELLERS_DIR" "$XIAMIMATE_RUNTIME_ROOT/raw/json/bestsellers"
 fi
 
 if [[ -n "${XIAMIMATE_BASELINE_ROOT:-}" ]]; then
     set_default_if_missing "XIAMIMATE_PYTHON_BIN" "$XIAMIMATE_BASELINE_ROOT/.venv/bin/python"
     set_default_if_missing "XIAMIMATE_DUCKDB_PATH" "$XIAMIMATE_BASELINE_ROOT/data_platform/storage/warehouse/local_analytics.duckdb"
+    set_default_if_missing "XIAMIMATE_RAW_JSON_ROOT" "$XIAMIMATE_BASELINE_ROOT/data_platform/storage/raw/json"
     set_default_if_missing "XIAMIMATE_RAW_PRODUCTS_DIR" "$XIAMIMATE_BASELINE_ROOT/data_platform/storage/raw/json/products"
+    set_default_if_missing "XIAMIMATE_RAW_BESTSELLERS_DIR" "$XIAMIMATE_BASELINE_ROOT/data_platform/storage/raw/json/bestsellers"
     set_default_if_missing "XIAMIMATE_INIT_SYNC_TABLES_SQL" "$XIAMIMATE_BASELINE_ROOT/data_platform/postgres/init_sync_tables.sql"
 fi
 

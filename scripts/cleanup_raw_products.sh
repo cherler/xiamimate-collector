@@ -3,8 +3,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PRODUCT_DIR="${RAW_PRODUCTS_DIR:-$ROOT_DIR/data_platform/storage/raw/json/products}"
-RETENTION_DAYS="${RAW_PRODUCTS_RETENTION_DAYS:-14}"
+# shellcheck source=scripts/load_collector_env.sh
+source "$ROOT_DIR/scripts/load_collector_env.sh"
+RAW_JSON_ROOT="${RAW_JSON_ROOT:-${XIAMIMATE_RAW_JSON_ROOT:-$ROOT_DIR/data_platform/storage/raw/json}}"
+PRODUCT_DIR="${RAW_PRODUCTS_DIR:-${XIAMIMATE_RAW_PRODUCTS_DIR:-$RAW_JSON_ROOT/products}}"
+BESTSELLERS_DIR="${RAW_BESTSELLERS_DIR:-${XIAMIMATE_RAW_BESTSELLERS_DIR:-$RAW_JSON_ROOT/bestsellers}}"
+RETENTION_DAYS="${RAW_JSON_RETENTION_DAYS:-${RAW_PRODUCTS_RETENTION_DAYS:-14}}"
 MODE="${1:---dry-run}"
 
 usage() {
@@ -29,8 +33,15 @@ if [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || [[ "$RETENTION_DAYS" -lt 1 ]]; then
     exit 1
 fi
 
-if [[ ! -d "$PRODUCT_DIR" ]]; then
-    echo "raw products directory not found: $PRODUCT_DIR"
+TARGET_DIRS=()
+for candidate in "$PRODUCT_DIR" "$BESTSELLERS_DIR"; do
+    if [[ -d "$candidate" ]]; then
+        TARGET_DIRS+=("$candidate")
+    fi
+done
+
+if [[ "${#TARGET_DIRS[@]}" -eq 0 ]]; then
+    echo "raw json directories not found: $PRODUCT_DIR $BESTSELLERS_DIR"
     exit 1
 fi
 
@@ -39,7 +50,9 @@ mtime_threshold=$((RETENTION_DAYS - 1))
 tmp_list="$(mktemp)"
 trap 'rm -f "$tmp_list"' EXIT
 
-find "$PRODUCT_DIR" -type f \( -name "*.json" -o -name "*.json.gz" \) ! -name "*.meta.json" -mtime +"$mtime_threshold" -print > "$tmp_list"
+for target_dir in "${TARGET_DIRS[@]}"; do
+    find "$target_dir" -type f \( -name "*.json" -o -name "*.json.gz" \) ! -name "*.meta.json" -mtime +"$mtime_threshold" -print >> "$tmp_list"
+done
 
 tmp_payloads="$(mktemp)"
 trap 'rm -f "$tmp_list" "$tmp_payloads"' EXIT
@@ -57,11 +70,16 @@ while IFS= read -r payload; do
     fi
 done < "$tmp_payloads"
 
-find "$PRODUCT_DIR" -type f -name "*.meta.json" -mtime +"$mtime_threshold" -print >> "$tmp_list"
+for target_dir in "${TARGET_DIRS[@]}"; do
+    find "$target_dir" -type f -name "*.meta.json" -mtime +"$mtime_threshold" -print >> "$tmp_list"
+done
 
 file_count="$(sort -u "$tmp_list" | sed '/^$/d' | wc -l | tr -d ' ')"
 
+echo "raw json root: $RAW_JSON_ROOT"
 echo "raw products dir: $PRODUCT_DIR"
+echo "raw bestsellers dir: $BESTSELLERS_DIR"
+echo "existing target dirs: ${TARGET_DIRS[*]}"
 echo "retention days: $RETENTION_DAYS"
 echo "mode: $MODE"
 echo "matched files: $file_count"
@@ -71,7 +89,7 @@ if [[ "$file_count" == "0" ]]; then
 fi
 
 echo "sample files:"
-sort -u "$tmp_list" | sed '/^$/d' | head -n 10
+sort -u "$tmp_list" | sed '/^$/d' | sed -n '1,10p'
 
 if [[ "$APPLY" != true ]]; then
     echo "dry-run only; rerun with --apply to delete matched files"
