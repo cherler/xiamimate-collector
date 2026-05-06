@@ -6,6 +6,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${XIAMIMATE_COLLECTOR_ENV_FILE:-$ROOT_DIR/data_collector/.env}"
 SYSTEMD_DIR="${XIAMIMATE_COLLECTOR_SYSTEMD_DIR:-/etc/systemd/system}"
 
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 systemd_available() {
     command -v systemctl >/dev/null 2>&1
 }
@@ -17,6 +24,9 @@ service_name_for() {
             ;;
         duckdb-snapshot)
             echo "xiamimate-duckdb-snapshot.service"
+            ;;
+        forecast-snapshot)
+            echo "xiamimate-forecast-duckdb-snapshot.service"
             ;;
         *)
             echo "unsupported job: $1" >&2
@@ -32,6 +42,9 @@ timer_name_for() {
             ;;
         duckdb-snapshot)
             echo "xiamimate-duckdb-snapshot.timer"
+            ;;
+        forecast-snapshot)
+            echo "xiamimate-forecast-duckdb-snapshot.timer"
             ;;
         *)
             echo "unsupported job: $1" >&2
@@ -56,6 +69,9 @@ description_for() {
         duckdb-snapshot)
             echo "XiaMimate DuckDB Snapshot Publisher"
             ;;
+        forecast-snapshot)
+            echo "XiaMimate Forecast DuckDB Snapshot Publisher"
+            ;;
     esac
 }
 
@@ -67,6 +83,9 @@ exec_start_for() {
         duckdb-snapshot)
             echo "/bin/bash $ROOT_DIR/scripts/publish_duckdb_snapshot.sh"
             ;;
+        forecast-snapshot)
+            echo "/bin/bash $ROOT_DIR/scripts/publish_forecast_weekly_snapshot.sh"
+            ;;
     esac
 }
 
@@ -77,6 +96,20 @@ schedule_for() {
             ;;
         duckdb-snapshot)
             echo "Sun *-*-* 02:00:00"
+            ;;
+        forecast-snapshot)
+            echo "${XIAMIMATE_FORECAST_SNAPSHOT_TIMER_CALENDAR:-Sun *-*-* 02:30:00}"
+            ;;
+    esac
+}
+
+persistent_for() {
+    case "$1" in
+        forecast-snapshot)
+            echo "false"
+            ;;
+        *)
+            echo "true"
             ;;
     esac
 }
@@ -115,7 +148,7 @@ Description=$(description_for "$job") Timer
 
 [Timer]
 OnCalendar=$(schedule_for "$job")
-Persistent=true
+Persistent=$(persistent_for "$job")
 Unit=$(service_name_for "$job")
 
 [Install]
@@ -183,7 +216,7 @@ run_for_jobs() {
     local jobs=()
 
     if [[ "$target" == "all" ]]; then
-        jobs=(raw-cleanup)
+        jobs=(raw-cleanup forecast-snapshot)
     else
         jobs=("$target")
     fi
@@ -221,14 +254,14 @@ run_for_jobs() {
 usage() {
     cat <<EOF
 Usage:
-    bash scripts/manage_ecs2_lifecycle_services.sh install [all|raw-cleanup|duckdb-snapshot]
-    bash scripts/manage_ecs2_lifecycle_services.sh uninstall [all|raw-cleanup|duckdb-snapshot]
-    bash scripts/manage_ecs2_lifecycle_services.sh status [all|raw-cleanup|duckdb-snapshot]
-  bash scripts/manage_ecs2_lifecycle_services.sh run-once [raw-cleanup|duckdb-snapshot]
-  bash scripts/manage_ecs2_lifecycle_services.sh logs [raw-cleanup|duckdb-snapshot]
+    bash scripts/manage_ecs2_lifecycle_services.sh install [all|raw-cleanup|duckdb-snapshot|forecast-snapshot]
+    bash scripts/manage_ecs2_lifecycle_services.sh uninstall [all|raw-cleanup|duckdb-snapshot|forecast-snapshot]
+    bash scripts/manage_ecs2_lifecycle_services.sh status [all|raw-cleanup|duckdb-snapshot|forecast-snapshot]
+    bash scripts/manage_ecs2_lifecycle_services.sh run-once [raw-cleanup|duckdb-snapshot|forecast-snapshot]
+    bash scripts/manage_ecs2_lifecycle_services.sh logs [raw-cleanup|duckdb-snapshot|forecast-snapshot]
 
 Note:
-    all installs raw-cleanup only. DuckDB snapshots are refreshed by pg/theme sync jobs.
+    all installs raw-cleanup and forecast-snapshot. Rolling DuckDB snapshots are refreshed by pg sync jobs.
 EOF
 }
 

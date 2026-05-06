@@ -160,6 +160,9 @@ else
 
     check_timer xiamimate-raw-products-cleanup.timer
     check_service xiamimate-raw-products-cleanup.service false
+
+    check_timer xiamimate-forecast-duckdb-snapshot.timer
+    check_service xiamimate-forecast-duckdb-snapshot.service false
 fi
 
 check_disk
