@@ -33,6 +33,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 from typing import Any
 
 from .asin_discovery import (
@@ -257,10 +259,68 @@ class AutoCollector:
             )
         except ValueError:
             self.business_priority_refresh_interval_seconds = 21600
+        try:
+            self.history_max_batches_per_run = max(
+                0,
+                int(os.environ.get("AUTO_HISTORY_MAX_BATCHES_PER_RUN", "0") or "0"),
+            )
+        except ValueError:
+            self.history_max_batches_per_run = 0
+        try:
+            self.google_trends_batch_size = max(
+                1,
+                min(5, int(os.environ.get("AUTO_GOOGLE_TRENDS_BATCH_SIZE", "5") or "5")),
+            )
+        except ValueError:
+            self.google_trends_batch_size = 5
+        try:
+            self.google_trends_max_batches_per_run = max(
+                0,
+                int(os.environ.get("AUTO_GOOGLE_TRENDS_MAX_BATCHES_PER_RUN", "0") or "0"),
+            )
+        except ValueError:
+            self.google_trends_max_batches_per_run = 0
+        try:
+            self.google_trends_max_keywords_per_run = max(
+                1,
+                int(os.environ.get("AUTO_GOOGLE_TRENDS_MAX_KEYWORDS_PER_RUN", "20") or "20"),
+            )
+        except ValueError:
+            self.google_trends_max_keywords_per_run = 20
+        try:
+            self.google_trends_request_interval_seconds = max(
+                0.0,
+                float(os.environ.get("AUTO_GOOGLE_TRENDS_REQUEST_INTERVAL_SECONDS", "0") or "0"),
+            )
+        except ValueError:
+            self.google_trends_request_interval_seconds = 0.0
+        try:
+            self.google_trends_cooldown_seconds = max(
+                0,
+                int(os.environ.get("AUTO_GOOGLE_TRENDS_COOLDOWN_SECONDS", "0") or "0"),
+            )
+        except ValueError:
+            self.google_trends_cooldown_seconds = 0
+        self.google_trends_mihomo_controller_url = (
+            os.environ.get("AUTO_GOOGLE_TRENDS_MIHOMO_CONTROLLER_URL")
+            or os.environ.get("GOOGLE_TRENDS_MIHOMO_CONTROLLER_URL")
+            or ""
+        ).strip().rstrip("/")
+        self.google_trends_mihomo_switch_group = (
+            os.environ.get("AUTO_GOOGLE_TRENDS_MIHOMO_SWITCH_GROUP")
+            or os.environ.get("GOOGLE_TRENDS_MIHOMO_SWITCH_GROUP")
+            or ""
+        ).strip()
+        self.google_trends_mihomo_secret = (
+            os.environ.get("AUTO_GOOGLE_TRENDS_MIHOMO_SECRET")
+            or os.environ.get("GOOGLE_TRENDS_MIHOMO_SECRET")
+            or ""
+        ).strip()
+        log_dir = Path(os.environ.get("XIAMIMATE_LOG_DIR", "logs")).expanduser()
         self.business_priority_refresh_state_file = (
-            Path(os.environ.get("XIAMIMATE_LOG_DIR", "logs")).expanduser()
-            / f"business_priority_refresh_domain_{self.domain}.state"
+            log_dir / f"business_priority_refresh_domain_{self.domain}.state"
         )
+        self.google_trends_cooldown_state_file = log_dir / f"google_trends_cooldown_domain_{self.domain}.state"
         self.seed_file = seed_file
         self.categories = categories or _load_categories_for_domain(domain)
         self.search_terms = search_terms or []
@@ -422,10 +482,10 @@ class AutoCollector:
         except Exception:
             self._stats["bestseller_pending"] = 0
         try:
-            pending_check = self.storage.get_asins_to_fetch(
-                domain=self.domain, max_count=1, stale_hours=self.stale_hours,
+            self._stats["asins_pending"] = self.storage.count_asins_to_fetch(
+                domain=self.domain,
+                stale_hours=self.stale_hours,
             )
-            self._stats["asins_pending"] = len(pending_check)
         except Exception:
             self._stats["asins_pending"] = 0
 
@@ -833,9 +893,10 @@ class AutoCollector:
             logger.info(f"从种子文件加载 {len(seeds)} 个 ASIN")
 
         # 1b. 自动检测 DuckDB 中待采集 ASIN (未采集 / 已过期)
-        pending_count = len(self.storage.get_asins_to_fetch(
-            domain=self.domain, max_count=99999, stale_hours=self.stale_hours,
-        ))
+        pending_count = self.storage.count_asins_to_fetch(
+            domain=self.domain,
+            stale_hours=self.stale_hours,
+        )
 
         interactive_pending = bool(self._stats.get("interactive_expansion_pending"))
 
@@ -1031,6 +1092,7 @@ class AutoCollector:
         logger.info("--- Phase 2: 采集 Keepa 历史数据 ---")
         total_fetched = 0
         total_rows = 0
+        batches_fetched = 0
         consecutive_errors = 0
         max_consecutive_errors = 5
 
@@ -1253,6 +1315,15 @@ class AutoCollector:
                 except Exception as e:
                     logger.warning(f"DuckDB checkpoint 失败: {e}")
 
+                batches_fetched += 1
+                if self.history_max_batches_per_run and batches_fetched >= self.history_max_batches_per_run:
+                    logger.info(
+                        "history 本轮已处理 %s/%s 批，释放 DuckDB 锁给同步任务",
+                        batches_fetched,
+                        self.history_max_batches_per_run,
+                    )
+                    break
+
             except Exception as e:
                 consecutive_errors += 1
                 logger.error(f"采集 {asin_list[:3]}... 失败 ({consecutive_errors}/{max_consecutive_errors}): {e}")
@@ -1310,15 +1381,13 @@ class AutoCollector:
             logger.info("未启用 strategy expansion, 跳过")
             return
 
-        pending = self.storage.get_asins_to_fetch(
+        pending_count = self.storage.count_asins_to_fetch(
             domain=self.domain,
-            max_count=self.strategy_pending_threshold + 1,
             stale_hours=self.stale_hours,
         )
-        pending_count = len(pending)
         if pending_count > self.strategy_pending_threshold:
             logger.info(
-                f"待采集池仍有 {pending_count} 个 ASIN (> {self.strategy_pending_threshold}), 暂不做 L2/L3/L4 / keyword 扩张"
+                f"待采集池总数仍有 {pending_count} 个 ASIN (> {self.strategy_pending_threshold}), 暂不做 L2/L3/L4 / keyword 扩张"
             )
             return
 
@@ -1684,10 +1753,26 @@ class AutoCollector:
             try:
                 from .collectors import GoogleTrendsCollector
                 hl = self._DOMAIN_TO_HL.get(self.domain, "en-US")
-                self._trends_collector = GoogleTrendsCollector(hl=hl)
+                proxy_url = (
+                    os.environ.get("GOOGLE_TRENDS_PROXY_URL")
+                    or os.environ.get("AUTO_COLLECT_GOOGLE_TRENDS_PROXY_URL")
+                    or ""
+                ).strip()
+                if proxy_url:
+                    logger.info("Google Trends 使用显式代理: %s", self._redact_proxy_url(proxy_url))
+                self._trends_collector = GoogleTrendsCollector(hl=hl, proxy_url=proxy_url or None)
             except ImportError:
                 logger.warning("GoogleTrendsCollector 不可用 (pytrends 未安装)")
         return self._trends_collector
+
+    @staticmethod
+    def _redact_proxy_url(proxy_url: str) -> str:
+        parsed = urlsplit(proxy_url)
+        if not parsed.username and not parsed.password:
+            return proxy_url
+        hostname = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        return urlunsplit((parsed.scheme, f"***:***@{hostname}{port}", parsed.path, parsed.query, parsed.fragment))
 
     @staticmethod
     def _trends_timeframe() -> str:
@@ -1701,6 +1786,134 @@ class AutoCollector:
         """
         return "today 3-m"
 
+    def _google_trends_pause_remaining_seconds(self) -> float:
+        try:
+            text = self.google_trends_cooldown_state_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return 0.0
+        except Exception as e:
+            logger.warning("读取 Google Trends 冷却状态失败: %s", e)
+            return 0.0
+
+        pause_until = 0.0
+        for line in text.splitlines():
+            if line.startswith("pause_until_epoch="):
+                try:
+                    pause_until = float(line.split("=", 1)[1])
+                except ValueError:
+                    pause_until = 0.0
+                break
+        return max(0.0, pause_until - time.time())
+
+    def _google_trends_is_paused(self) -> bool:
+        remaining = self._google_trends_pause_remaining_seconds()
+        if remaining <= 0:
+            return False
+        logger.info("Google Trends 处于冷却中，剩余 %.0fs，本轮跳过", remaining)
+        return True
+
+    def _pause_google_trends(self, reason: str) -> None:
+        if self.google_trends_cooldown_seconds <= 0:
+            return
+        pause_until = time.time() + self.google_trends_cooldown_seconds
+        until_text = datetime.fromtimestamp(pause_until, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            self.google_trends_cooldown_state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.google_trends_cooldown_state_file.write_text(
+                f"pause_until_epoch={pause_until}\nreason={reason}\npause_until_utc={until_text}\n",
+                encoding="utf-8",
+            )
+            logger.info(
+                "Google Trends 进入冷却 %ss，原因: %s，恢复时间(UTC): %s",
+                self.google_trends_cooldown_seconds,
+                reason,
+                until_text,
+            )
+        except Exception as e:
+            logger.warning("写入 Google Trends 冷却状态失败: %s", e)
+
+    def _mihomo_request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.google_trends_mihomo_controller_url:
+            return {}
+
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"}
+        if self.google_trends_mihomo_secret:
+            headers["Authorization"] = f"Bearer {self.google_trends_mihomo_secret}"
+
+        request = Request(
+            f"{self.google_trends_mihomo_controller_url}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        with urlopen(request, timeout=5) as response:
+            body = response.read().decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _rotate_google_trends_proxy_node(self) -> bool:
+        if not self.google_trends_mihomo_controller_url or not self.google_trends_mihomo_switch_group:
+            return False
+
+        try:
+            proxies = self._mihomo_request("GET", "/proxies")
+            group = proxies.get("proxies", {}).get(self.google_trends_mihomo_switch_group) or {}
+            candidates = [name for name in group.get("all", []) if name and name not in {"DIRECT", "REJECT"}]
+            if len(candidates) < 2:
+                logger.info(
+                    "Google Trends Mihomo 分组 %s 可切换候选不足，跳过切节点",
+                    self.google_trends_mihomo_switch_group,
+                )
+                return False
+
+            current = group.get("now") or candidates[0]
+            try:
+                current_index = candidates.index(current)
+            except ValueError:
+                current_index = -1
+            next_name = candidates[(current_index + 1) % len(candidates)]
+
+            self._mihomo_request(
+                "PUT",
+                f"/proxies/{quote(self.google_trends_mihomo_switch_group, safe='')}",
+                {"name": next_name},
+            )
+            self._trends_collector = None
+            logger.info(
+                "Google Trends Mihomo 分组 %s 已从 %s 切换到 %s",
+                self.google_trends_mihomo_switch_group,
+                current,
+                next_name,
+            )
+            return True
+        except Exception as e:
+            logger.warning("Google Trends Mihomo 切节点失败: %s", e)
+            return False
+
+    def _handle_google_trends_error(self, batch: list[str], exc: Exception, *, prefix: str, batches_done: int) -> bool:
+        err_str = str(exc).lower()
+        should_pause = any(
+            marker in err_str
+            for marker in ["429", "too many", "rate", "network is unreachable", "timed out", "timeout"]
+        )
+        if should_pause:
+            self._trends_keyword_queue = batch + self._trends_keyword_queue
+            reason = str(exc).splitlines()[0][:180]
+            switched = self._rotate_google_trends_proxy_node()
+            self._pause_google_trends(reason)
+            logger.info(
+                "%s Google Trends 限流/网络异常，%s，暂停 (已完成 %s 批): %s",
+                prefix,
+                "已尝试切换 Mihomo 节点" if switched else "未切换节点",
+                batches_done,
+                reason,
+            )
+            return True
+
+        logger.warning("%s Google Trends %s 失败: %s", prefix, batch, exc)
+        self._trends_fetched_keywords.update(batch)
+        return False
+
     def _fetch_trends_during_wait(self, wait_secs: float) -> None:
         """在 token 等待期间采集 Google Trends (免费, 不消耗 Keepa token).
 
@@ -1708,6 +1921,10 @@ class AutoCollector:
         每批 5 个关键词, pytrends 限流时提前退出.
         """
         if not self.enable_google_trends:
+            time.sleep(wait_secs)
+            return
+
+        if self._google_trends_is_paused():
             time.sleep(wait_secs)
             return
 
@@ -1727,9 +1944,16 @@ class AutoCollector:
         batches_done = 0
 
         while self._trends_keyword_queue and time.time() < deadline:
-            # 取一批 (最多 5 个关键词)
-            batch = self._trends_keyword_queue[:5]
-            self._trends_keyword_queue = self._trends_keyword_queue[5:]
+            if self.google_trends_max_batches_per_run and batches_done >= self.google_trends_max_batches_per_run:
+                logger.info(
+                    "  [等待期] Google Trends 本轮已处理 %s/%s 批，停止以降低频率",
+                    batches_done,
+                    self.google_trends_max_batches_per_run,
+                )
+                break
+
+            batch = self._trends_keyword_queue[: self.google_trends_batch_size]
+            self._trends_keyword_queue = self._trends_keyword_queue[self.google_trends_batch_size :]
 
             try:
                 trend_rows = collector.fetch_interest_over_time(
@@ -1743,16 +1967,17 @@ class AutoCollector:
                     logger.info(f"  [等待期] Google Trends: {batch} → {ingested} 行")
                 self._trends_fetched_keywords.update(batch)
                 batches_done += 1
+                if self.google_trends_request_interval_seconds > 0 and self._trends_keyword_queue:
+                    time.sleep(min(self.google_trends_request_interval_seconds, max(0.0, deadline - time.time())))
             except Exception as e:
-                err_str = str(e).lower()
-                if "429" in err_str or "rate" in err_str:
-                    # pytrends 限流, 把关键词放回队列头部, 退出等待
-                    self._trends_keyword_queue = batch + self._trends_keyword_queue
-                    logger.info(f"  [等待期] Google Trends 限流, 暂停 (已完成 {batches_done} 批)")
+                should_break = self._handle_google_trends_error(
+                    batch,
+                    e,
+                    prefix="  [等待期]",
+                    batches_done=batches_done,
+                )
+                if should_break:
                     break
-                else:
-                    logger.warning(f"  [等待期] Google Trends {batch} 失败: {e}")
-                    self._trends_fetched_keywords.update(batch)  # 标记为已尝试, 避免反复重试
 
         # 剩余时间继续等待 (确保 token 有时间恢复)
         remaining = deadline - time.time()
@@ -1766,6 +1991,9 @@ class AutoCollector:
     def _fetch_google_trends(self) -> None:
         """从已采集的商品标题中提取关键词, 查询 Google Trends."""
         logger.info("--- Phase 3: Google Trends ---")
+
+        if self._google_trends_is_paused():
+            return
 
         # 确保 collector 使用正确的 hl (匹配当前 domain)
 
@@ -1814,16 +2042,23 @@ class AutoCollector:
             logger.info("所有关键词已在等待期间采集完成, 跳过")
             return
 
-        # Google Trends 有频率限制, 每次少量查询
-        keywords_list = sorted(all_keywords)[:20]  # 每次最多 20 个
+        keywords_list = sorted(all_keywords)[: self.google_trends_max_keywords_per_run]
 
         try:
             trends_collector = self._get_trends_collector()
             if trends_collector is None:
                 return
-            # pytrends 一次最多 5 个关键词
-            for i in range(0, len(keywords_list), 5):
-                batch = keywords_list[i : i + 5]
+            batches_done = 0
+            for i in range(0, len(keywords_list), self.google_trends_batch_size):
+                if self.google_trends_max_batches_per_run and batches_done >= self.google_trends_max_batches_per_run:
+                    logger.info(
+                        "  Google Trends 本轮已处理 %s/%s 批，停止以降低频率",
+                        batches_done,
+                        self.google_trends_max_batches_per_run,
+                    )
+                    break
+
+                batch = keywords_list[i : i + self.google_trends_batch_size]
                 try:
                     trend_rows = trends_collector.fetch_interest_over_time(
                         keywords=batch,
@@ -1835,13 +2070,18 @@ class AutoCollector:
                         self._stats["trends_rows_ingested"] += ingested
                         logger.info(f"  Google Trends: {batch} → {ingested} 行")
                     self._trends_fetched_keywords.update(batch)
+                    batches_done += 1
+                    if self.google_trends_request_interval_seconds > 0 and i + self.google_trends_batch_size < len(keywords_list):
+                        time.sleep(self.google_trends_request_interval_seconds)
                 except Exception as e:
-                    err_str = str(e).lower()
-                    if "429" in err_str or "rate" in err_str:
-                        logger.info(f"  Google Trends 限流, 停止本轮 (已完成 {i // 5} 批)")
+                    should_break = self._handle_google_trends_error(
+                        batch,
+                        e,
+                        prefix=" ",
+                        batches_done=batches_done,
+                    )
+                    if should_break:
                         break
-                    logger.warning(f"  Google Trends {batch} 失败: {e}")
-                    self._trends_fetched_keywords.update(batch)
                     time.sleep(10)
 
         except Exception as e:

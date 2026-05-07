@@ -152,9 +152,6 @@ else
     check_timer xiamimate-theme-sync-snapshot.timer
     check_service xiamimate-theme-sync-snapshot.service false
 
-    check_timer xiamimate-pg-history-sync-snapshot.timer
-    check_service xiamimate-pg-history-sync-snapshot.service false
-
     check_timer xiamimate-pg-agg-sync-snapshot.timer
     check_service xiamimate-pg-agg-sync-snapshot.service false
 
@@ -171,7 +168,6 @@ check_snapshot
 check_log_file "$LOG_DIR/auto_collect.service.log"
 check_log_file "$LOG_DIR/pg_sync.timer.log"
 check_timer_log_file xiamimate-theme-sync-snapshot.timer "$LOG_DIR/theme_sync.timer.log"
-check_timer_log_file xiamimate-pg-history-sync-snapshot.timer "$LOG_DIR/pg_history_sync.timer.log"
 check_timer_log_file xiamimate-pg-agg-sync-snapshot.timer "$LOG_DIR/pg_agg_sync.timer.log"
 
 echo "=== summary: errors=$ERRORS warnings=$WARNINGS ==="

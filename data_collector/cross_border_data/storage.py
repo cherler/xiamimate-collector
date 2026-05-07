@@ -565,6 +565,25 @@ class DuckDBStorage:
         ]
         return [dict(zip(columns, row)) for row in rows]
 
+    def count_asins_to_fetch(
+        self,
+        *,
+        domain: int = 1,
+        stale_hours: int = 336,
+    ) -> int:
+        """Return the exact number of active ASINs that need history hydration."""
+        stale_hours_sql = _build_dynamic_stale_hours_sql(int(stale_hours))
+        row = self.conn.execute(
+            f"""SELECT COUNT(*)
+               FROM curated.keepa_asin_registry
+               WHERE domain = ?
+                 AND is_active = TRUE
+                 AND (last_fetched_at IS NULL
+                      OR date_diff('hour', last_fetched_at, CURRENT_TIMESTAMP) >= ({stale_hours_sql}))""",
+            [domain],
+        ).fetchone()
+        return int(row[0] if row else 0)
+
     def filter_asins_to_fetch(
         self,
         asins: list[str],

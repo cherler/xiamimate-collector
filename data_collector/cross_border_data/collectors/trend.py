@@ -24,8 +24,9 @@ warnings.filterwarnings(
 class GoogleTrendsCollector:
     """Collector for Google Trends based on pytrends."""
 
-    def __init__(self, hl: str = "en-US", tz: int = 0) -> None:
-        self.client = TrendReq(hl=hl, tz=tz)
+    def __init__(self, hl: str = "en-US", tz: int = 0, proxy_url: str | None = None) -> None:
+        proxies = [proxy_url] if proxy_url else []
+        self.client = TrendReq(hl=hl, tz=tz, proxies=proxies)
 
     def fetch_interest_over_time(
         self,

@@ -16,7 +16,6 @@ fi
 
 PG_INTERVAL="${XIAMIMATE_PG_SYNC_TIMER_INTERVAL:-5min}"
 THEME_CALENDAR="${XIAMIMATE_THEME_SYNC_TIMER_CALENDAR:-*-*-* 01:00:00}"
-PG_HISTORY_INTERVAL="${XIAMIMATE_PG_HISTORY_SYNC_TIMER_INTERVAL:-6h}"
 PG_HISTORY_CALENDAR="${XIAMIMATE_PG_HISTORY_SYNC_TIMER_CALENDAR:-*-*-* 00/6:00:00}"
 PG_AGG_CALENDAR="${XIAMIMATE_PG_AGG_SYNC_TIMER_CALENDAR:-Sun *-*-* 04:00:00}"
 
@@ -77,7 +76,7 @@ timer_path_for() {
 description_for() {
     case "$1" in
         pg-sync)
-            echo "XiaMimate PostgreSQL Snapshot Sync"
+            echo "XiaMimate PostgreSQL Live DuckDB Sync"
             ;;
         theme-sync)
             echo "XiaMimate Theme Snapshot Sync"
@@ -252,6 +251,10 @@ install_job() {
     echo "installed: $(service_name_for "$job") + $timer_name"
 }
 
+decommission_removed_jobs() {
+    uninstall_job pg-history-sync
+}
+
 uninstall_job() {
     local job="$1"
     local service_name timer_name
@@ -300,7 +303,14 @@ run_for_jobs() {
     local jobs=()
 
     if [[ "$target" == "all" ]]; then
-        jobs=(pg-sync theme-sync pg-history-sync pg-agg-sync)
+        case "$action" in
+            install|status|logs|run-once)
+                jobs=(pg-sync theme-sync pg-agg-sync)
+                ;;
+            uninstall)
+                jobs=(pg-sync theme-sync pg-history-sync pg-agg-sync)
+                ;;
+        esac
     else
         jobs=("$target")
     fi
@@ -330,6 +340,9 @@ run_for_jobs() {
     done
 
     if [[ "$action" == "install" || "$action" == "uninstall" ]]; then
+        if [[ "$action" == "install" && "$target" == "all" ]]; then
+            decommission_removed_jobs
+        fi
         systemctl daemon-reload
         systemctl reset-failed >/dev/null 2>&1 || true
     fi
@@ -347,11 +360,10 @@ Usage:
 Environment:
   XIAMIMATE_COLLECTOR_ENV_FILE         default: $ROOT_DIR/data_collector/.env
   XIAMIMATE_COLLECTOR_SYSTEMD_DIR      default: /etc/systemd/system
-  XIAMIMATE_PG_SYNC_TIMER_INTERVAL     default: 5min
-  XIAMIMATE_THEME_SYNC_TIMER_CALENDAR  default: *-*-* 01:00:00
-    XIAMIMATE_PG_HISTORY_SYNC_TIMER_INTERVAL default: 6h (legacy)
-    XIAMIMATE_PG_HISTORY_SYNC_TIMER_CALENDAR default: *-*-* 00/6:00:00
-    XIAMIMATE_PG_AGG_SYNC_TIMER_CALENDAR     default: Sun *-*-* 04:00:00
+    XIAMIMATE_PG_SYNC_TIMER_INTERVAL     default: 5min
+    XIAMIMATE_THEME_SYNC_TIMER_CALENDAR  default: *-*-* 01:00:00
+    XIAMIMATE_PG_AGG_SYNC_TIMER_CALENDAR default: Sun *-*-* 04:00:00
+    pg-history-sync is legacy; install all disables its timer because history is included in pg-sync.
 EOF_USAGE
 }
 

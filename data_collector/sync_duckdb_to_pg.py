@@ -795,7 +795,7 @@ def _trigger_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) 
                 **os.environ,
                 "PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE": "false",
                 "CANDIDATE_EXPANSION_JOB_IDS": ",".join(completed_job_ids),
-                "CANDIDATE_EXPANSION_DUCKDB_SOURCE": "snapshot",
+                "CANDIDATE_EXPANSION_DUCKDB_SOURCE": "live",
                 "CANDIDATE_EXPANSION_REFRESH_SNAPSHOT": "false",
             },
         )
