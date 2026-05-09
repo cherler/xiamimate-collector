@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 data_collector/__pycache__/
 data_collector/.env
-data_collector/.env.*
 .venv/
 logs/
 data_platform/storage/raw/json/bestsellers
