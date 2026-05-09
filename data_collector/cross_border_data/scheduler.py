@@ -372,8 +372,8 @@ class AutoCollector:
             logger.info(
                 f"类目注册表 (domain={self.domain}/{geo}): "
                 f"{cat_stats['total_categories']} 个类目, "
-                f"已采集 BestSeller {cat_stats['bestseller_fetched']} 个, "
-                f"待采集 {cat_stats['bestseller_pending']} 个"
+                f"已至少采过 BestSeller {cat_stats['bestseller_fetched']} 个, "
+                f"到期待刷新/未采集 {cat_stats['bestseller_pending']} 个"
             )
             return
 
@@ -497,7 +497,7 @@ class AutoCollector:
             f"停用 {self._stats['asins_deactivated']} ASIN | "
             f"写入 {self._stats['history_rows_ingested']} 行 | "
             f"消耗 {self._stats['tokens_consumed']} token | "
-            f"剩余类目 {self._stats['bestseller_pending']} | "
+            f"待刷新类目 {self._stats['bestseller_pending']} | "
             f"剩余 ASIN {self._stats['asins_pending']}"
         )
         return dict(self._stats)
@@ -916,7 +916,8 @@ class AutoCollector:
         # 1c. 待采集池为空 → 从 category_registry 取下一个未读过 BestSeller 的类目
         cat_stats = self.storage.get_category_stats(self.domain)
         logger.info(
-            f"类目进度: {cat_stats['bestseller_fetched']}/{cat_stats['total_categories']} 已采集"
+            f"类目进度: {cat_stats['bestseller_fetched']}/{cat_stats['total_categories']} 已至少采过, "
+            f"当前到期待刷新/未采集 {cat_stats['bestseller_pending']} 个"
         )
 
         next_cat = self.storage.get_next_category_for_bestseller(self.domain)
@@ -934,7 +935,7 @@ class AutoCollector:
             next_cat = self.storage.get_next_category_for_bestseller(self.domain)
 
         if next_cat is None:
-            logger.info("所有类目的 BestSeller 均已采集完成, 无新类目可发现")
+            logger.info("当前没有到期的 L1 BestSeller 刷新类目, 无新类目可发现")
             # 注册种子 ASIN (如果有)
             if all_discovered:
                 new_count = self.storage.register_asins(all_discovered)
@@ -959,7 +960,7 @@ class AutoCollector:
         )
         if not decision.allowed:
             logger.info(
-                f"token 预算不足 ({decision.reason}), 无法拉取 BestSeller, 跳过类目 {cat_id} ({cat_name})"
+                f"token 预算不足 ({decision.reason}), 无法刷新 BestSeller, 本轮暂不处理类目 {cat_id} ({cat_name})"
             )
             if all_discovered:
                 new_count = self.storage.register_asins(all_discovered)
@@ -976,8 +977,11 @@ class AutoCollector:
             all_asins, raw_payload = self.discovery.fetch_best_sellers(
                 category=cat_id, domain=self.domain
             )
-            # 只取 top 100 ASIN
-            asins = all_asins[:100]
+            # 只取 top 100 ASIN, 并保持原始排名顺序去重。
+            asins = list(dict.fromkeys(all_asins))[:100]
+            existing_count = self.storage.count_registered_asins(asins, self.domain)
+            new_count = max(0, len(asins) - existing_count)
+            new_rate = (new_count / len(asins)) if asins else 0.0
 
             # 保存 BestSeller 原始 API 响应
             raw_path = _save_raw_response(
@@ -1015,7 +1019,8 @@ class AutoCollector:
 
             logger.info(
                 f"品类 {cat_id} ({cat_name}): BestSeller 返回 {len(all_asins)} 个 ASIN, "
-                f"截取 top {len(asins)}"
+                f"截取 top {len(asins)}, 新 ASIN {new_count}, 已存在 {existing_count}, "
+                f"新占比 {new_rate:.1%}"
             )
 
             for asin in asins:
@@ -1026,7 +1031,13 @@ class AutoCollector:
                     "discovery_source": "bestseller",
                 })
             # 标记该类目已采集
-            self.storage.mark_category_bestseller_done(cat_id, self.domain, len(asins))
+            self.storage.mark_category_bestseller_done(
+                cat_id,
+                self.domain,
+                len(asins),
+                new_asin_count=new_count,
+                existing_asin_count=existing_count,
+            )
             logger.info(
                 f"品类 {cat_id} ({cat_name}): 注册 {len(asins)} 个 ASIN, "
                 f"消耗 50 token"
@@ -2453,7 +2464,7 @@ def run_multi_domain_collect_loop(
                         logger.info(
                             f"  Domain {domain}/{geo} 第 {l1_round} 次: "
                             f"采集 {fetched} ASIN, 消耗 {consumed} token | "
-                            f"剩余类目 {bs_pending}, 剩余 ASIN {asin_pending}"
+                            f"待刷新类目 {bs_pending}, 剩余 ASIN {asin_pending}"
                         )
 
                         # 所有 L1 类目已采集且无待处理 ASIN → 该 domain 完成

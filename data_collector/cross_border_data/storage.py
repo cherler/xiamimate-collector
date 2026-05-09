@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 from typing import Any
@@ -67,6 +67,11 @@ _BUSINESS_TIER_PRIORITY_WINDOWS = {
     "P0": (90, 100),
     "P1": (60, 80),
     "P2": (20, 40),
+}
+
+_BESTSELLER_REFRESH_DEFAULT_DAYS = 14
+_BESTSELLER_REFRESH_DOMAIN_DAYS = {
+    1: 7,
 }
 
 
@@ -260,6 +265,11 @@ CREATE TABLE IF NOT EXISTS curated.keepa_category_registry (
     is_active         BOOLEAN DEFAULT TRUE,    -- 是否参与轮换
     bestseller_fetched_at  TIMESTAMP,          -- 上次读取 BestSeller 的时间
     bestseller_asin_count  INTEGER DEFAULT 0,  -- 上次读取到的 ASIN 数量
+    bestseller_next_refresh_at TIMESTAMP,       -- 下次允许刷新 BestSeller 的时间
+    bestseller_new_asin_count INTEGER DEFAULT 0,
+    bestseller_existing_asin_count INTEGER DEFAULT 0,
+    bestseller_new_asin_rate DOUBLE DEFAULT 0,
+    bestseller_refresh_interval_days INTEGER DEFAULT 14,
     children_fetched_at    TIMESTAMP,          -- 上次拉取子类目的时间
     sort_order        INTEGER DEFAULT 0,       -- CSV 中的顺序 (越小越优先)
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -347,6 +357,27 @@ class DuckDBStorage:
         )
         conn.execute(f"{_add_cat} depth INTEGER DEFAULT 1")
         conn.execute(f"{_add_cat} children_fetched_at TIMESTAMP")
+        conn.execute(f"{_add_cat} bestseller_next_refresh_at TIMESTAMP")
+        conn.execute(f"{_add_cat} bestseller_new_asin_count INTEGER DEFAULT 0")
+        conn.execute(f"{_add_cat} bestseller_existing_asin_count INTEGER DEFAULT 0")
+        conn.execute(f"{_add_cat} bestseller_new_asin_rate DOUBLE DEFAULT 0")
+        conn.execute(f"{_add_cat} bestseller_refresh_interval_days INTEGER DEFAULT 14")
+        conn.execute(
+            """UPDATE curated.keepa_category_registry
+               SET bestseller_next_refresh_at = bestseller_fetched_at + INTERVAL '7 days',
+                   bestseller_refresh_interval_days = 7
+               WHERE domain = 1
+                 AND bestseller_fetched_at IS NOT NULL
+                 AND bestseller_next_refresh_at IS NULL"""
+        )
+        conn.execute(
+            """UPDATE curated.keepa_category_registry
+               SET bestseller_next_refresh_at = bestseller_fetched_at + INTERVAL '14 days',
+                   bestseller_refresh_interval_days = 14
+               WHERE domain <> 1
+                 AND bestseller_fetched_at IS NOT NULL
+                 AND bestseller_next_refresh_at IS NULL"""
+        )
 
         # asin_keyword_mapping: 补齐 geo 列
         conn.execute(
@@ -517,6 +548,21 @@ class DuckDBStorage:
         ).fetchone()[0]
 
         return after_count - before_count
+
+    def count_registered_asins(self, asins: list[str], domain: int = 1) -> int:
+        """Return how many ASINs already exist in the registry for a domain."""
+        unique_asins = sorted({asin.strip() for asin in asins if asin and asin.strip()})
+        if not unique_asins:
+            return 0
+
+        placeholders = ", ".join(["?"] * len(unique_asins))
+        row = self.conn.execute(
+            f"""SELECT COUNT(DISTINCT asin)
+                FROM curated.keepa_asin_registry
+                WHERE domain = ? AND asin IN ({placeholders})""",
+            [domain, *unique_asins],
+        ).fetchone()
+        return int(row[0] if row else 0)
 
     def get_asins_to_fetch(
         self,
@@ -844,9 +890,8 @@ class DuckDBStorage:
     def get_next_category_for_bestseller(self, domain: int = 1) -> dict | None:
         """获取下一个需要拉取 BestSeller 的类目.
 
-        第一轮策略: 仅 L1 类目, product_count >= 50000.
-        按 product_count DESC 排序, 从未拉取过的优先.
-        全部拉完 → 返回 None.
+        策略: 仅 L1 类目, product_count >= 50000.
+        从未拉取过或已到刷新时间的类目会重新进入队列.
 
         Returns
         -------
@@ -857,10 +902,17 @@ class DuckDBStorage:
             """SELECT category_id, category_en, category_cn, product_count, depth
                FROM curated.keepa_category_registry
                WHERE domain = ? AND is_active = TRUE
-                 AND bestseller_fetched_at IS NULL
                  AND depth = 1
                  AND product_count >= 50000
-               ORDER BY product_count DESC
+                 AND (
+                     bestseller_fetched_at IS NULL
+                     OR bestseller_next_refresh_at IS NULL
+                     OR bestseller_next_refresh_at <= CURRENT_TIMESTAMP
+                 )
+               ORDER BY
+                 CASE WHEN bestseller_fetched_at IS NULL THEN 0 ELSE 1 END,
+                 COALESCE(bestseller_next_refresh_at, TIMESTAMP '1970-01-01') ASC,
+                 product_count DESC
                LIMIT 1""",
             [domain],
         ).fetchone()
@@ -875,14 +927,43 @@ class DuckDBStorage:
         }
 
     def mark_category_bestseller_done(
-        self, category_id: int, domain: int, asin_count: int
+        self,
+        category_id: int,
+        domain: int,
+        asin_count: int,
+        *,
+        new_asin_count: int | None = None,
+        existing_asin_count: int | None = None,
     ) -> None:
         """标记某类目的 BestSeller 已拉取."""
+        new_count = int(new_asin_count or 0)
+        existing_count = int(existing_asin_count or 0)
+        denominator = new_count + existing_count
+        new_rate = (new_count / denominator) if denominator > 0 else 0.0
+        interval_days = _compute_bestseller_refresh_interval_days(domain, new_rate)
+        now = datetime.now(timezone.utc)
+        next_refresh = (now + timedelta(days=interval_days)).strftime("%Y-%m-%d %H:%M:%S")
         self.conn.execute(
             """UPDATE curated.keepa_category_registry
-               SET bestseller_fetched_at = ?, bestseller_asin_count = ?
+               SET bestseller_fetched_at = ?,
+                   bestseller_asin_count = ?,
+                   bestseller_next_refresh_at = ?,
+                   bestseller_new_asin_count = ?,
+                   bestseller_existing_asin_count = ?,
+                   bestseller_new_asin_rate = ?,
+                   bestseller_refresh_interval_days = ?
                WHERE category_id = ? AND domain = ?""",
-            [_utc_now(), asin_count, category_id, domain],
+            [
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                asin_count,
+                next_refresh,
+                new_count,
+                existing_count,
+                new_rate,
+                interval_days,
+                category_id,
+                domain,
+            ],
         )
 
     def get_category_stats(self, domain: int = 1) -> dict:
@@ -901,6 +982,17 @@ class DuckDBStorage:
                  AND depth = 1 AND product_count >= 50000""",
             [domain],
         ).fetchone()[0]
+        pending = self.conn.execute(
+            """SELECT COUNT(*) FROM curated.keepa_category_registry
+               WHERE domain = ? AND is_active = TRUE
+                 AND depth = 1 AND product_count >= 50000
+                 AND (
+                     bestseller_fetched_at IS NULL
+                     OR bestseller_next_refresh_at IS NULL
+                     OR bestseller_next_refresh_at <= CURRENT_TIMESTAMP
+                 )""",
+            [domain],
+        ).fetchone()[0]
         total_all = self.conn.execute(
             "SELECT COUNT(*) FROM curated.keepa_category_registry WHERE domain = ? AND is_active = TRUE",
             [domain],
@@ -909,7 +1001,7 @@ class DuckDBStorage:
             "total_categories": total,
             "total_all_depths": total_all,
             "bestseller_fetched": fetched,
-            "bestseller_pending": total - fetched,
+            "bestseller_pending": pending,
         }
 
     def get_next_l1_for_children_fetch(self, domain: int = 1) -> dict | None:
@@ -2044,6 +2136,19 @@ class DuckDBStorage:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _base_bestseller_refresh_days(domain: int) -> int:
+    return _BESTSELLER_REFRESH_DOMAIN_DAYS.get(domain, _BESTSELLER_REFRESH_DEFAULT_DAYS)
+
+
+def _compute_bestseller_refresh_interval_days(domain: int, new_asin_rate: float) -> int:
+    base_days = _base_bestseller_refresh_days(domain)
+    if new_asin_rate >= 0.20:
+        return max(3, round(base_days / 2))
+    if new_asin_rate >= 0.05:
+        return base_days
+    return min(30, base_days * 2)
 
 
 def _safe_float(value: Any) -> float | None:
