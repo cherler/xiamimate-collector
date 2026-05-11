@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -94,6 +94,12 @@ PG_SYNC_DUCKDB_COPY_DIR = os.environ.get("PG_SYNC_DUCKDB_COPY_DIR", "").strip()
 PG_AGG_REFRESH_INTERVAL_SECONDS = max(
     300, int(os.environ.get("PG_AGG_REFRESH_INTERVAL_SECONDS", "3600"))
 )
+PG_SYNC_AGG_PARTITIONED = os.environ.get("PG_SYNC_AGG_PARTITIONED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE = os.environ.get(
     "PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE",
     "true",
@@ -108,7 +114,7 @@ THEME_SYNC_TRIGGER_SCRIPT = _resolve_configured_path(
 )
 _SYNC_COPY_DIRS: list[Path] = []
 
-HISTORY_DOMAIN_DAILY_SQL = f"""
+HISTORY_DOMAIN_DAILY_SQL_TEMPLATE = """
 SELECT
     h.date,
     h.domain,
@@ -125,10 +131,12 @@ SELECT
     AVG(h.monthly_sold) AS avg_monthly_sold,
     MAX(h.ingested_at) AS aggregated_at
 FROM curated.keepa_product_history h
+{where_clause}
 GROUP BY 1, 2
 """
+HISTORY_DOMAIN_DAILY_SQL = HISTORY_DOMAIN_DAILY_SQL_TEMPLATE.format(where_clause="")
 
-HISTORY_ROOT_CATEGORY_DAILY_SQL = f"""
+HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE = """
 SELECT
     h.date,
     h.domain,
@@ -154,7 +162,19 @@ LEFT JOIN curated.keepa_asin_registry r
     ON h.asin = r.asin AND h.domain = r.domain
 LEFT JOIN curated.keepa_category_registry c
     ON COALESCE(r.root_category_id, r.category_id) = c.category_id AND h.domain = c.domain
+{where_clause}
 GROUP BY 1, 2, 3
+"""
+HISTORY_ROOT_CATEGORY_DAILY_SQL = HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE.format(where_clause="")
+
+HISTORY_MONTH_PARTITIONS_SQL = """
+SELECT
+    domain,
+    date_trunc('month', date)::DATE AS start_date,
+    (date_trunc('month', date) + INTERVAL '1 month')::DATE AS end_date
+FROM curated.keepa_product_history
+GROUP BY 1, 2, 3
+ORDER BY 1, 2
 """
 
 # DuckDB 表 → PG 表映射 + 主键列
@@ -184,7 +204,9 @@ SYNC_TABLES = {
         "pk": ["date", "domain"],
         "timestamp_col": "aggregated_at",
         "duck_sql": HISTORY_DOMAIN_DAILY_SQL,
+        "duck_sql_template": HISTORY_DOMAIN_DAILY_SQL_TEMPLATE,
         "always_full_refresh": True,
+        "full_refresh_partition_values_sql": HISTORY_MONTH_PARTITIONS_SQL if PG_SYNC_AGG_PARTITIONED else None,
         "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
     },
     "agg.keepa_history_root_category_daily": {
@@ -192,7 +214,9 @@ SYNC_TABLES = {
         "pk": ["date", "domain", "root_category_id"],
         "timestamp_col": "aggregated_at",
         "duck_sql": HISTORY_ROOT_CATEGORY_DAILY_SQL,
+        "duck_sql_template": HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE,
         "always_full_refresh": True,
+        "full_refresh_partition_values_sql": HISTORY_MONTH_PARTITIONS_SQL if PG_SYNC_AGG_PARTITIONED else None,
         "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
     },
     "curated.google_trends_daily": {
@@ -397,6 +421,17 @@ def _build_duck_select(duck_source: str, config: dict) -> str:
     return f"SELECT * FROM {duck_source}"
 
 
+def _build_partitioned_agg_select(config: dict, domain: int, start_date: date, end_date: date) -> str:
+    template = config["duck_sql_template"]
+    where_clause = (
+        "WHERE "
+        f"h.domain = {int(domain)} "
+        f"AND h.date >= DATE '{start_date.isoformat()}' "
+        f"AND h.date < DATE '{end_date.isoformat()}'"
+    )
+    return f"SELECT * FROM ({template.format(where_clause=where_clause)}) AS src"
+
+
 def _append_duck_where(base_query: str, where_clause: str) -> str:
     return f"SELECT * FROM ({base_query}) AS scoped_src WHERE {where_clause}"
 
@@ -507,6 +542,158 @@ def _normalize_batch_rows(
     return normalized_rows
 
 
+def _prepare_result_columns(result, config: dict) -> tuple[list[str], list[int] | None, list[str]]:
+    source_columns = [desc[0] for desc in result.description]
+    skip = set(config.get("skip_columns", []))
+    if not skip:
+        return source_columns, None, source_columns
+
+    keep_idx = [i for i, column in enumerate(source_columns) if column not in skip]
+    columns = [source_columns[i] for i in keep_idx]
+    return source_columns, keep_idx, columns
+
+
+def _build_pg_insert_sql(pg_table: str, columns: list[str], pk: list[str]) -> str:
+    col_list = ", ".join(columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    if not pk:
+        return f"INSERT INTO {pg_table} ({col_list}) VALUES ({placeholders})"
+
+    pk_list = ", ".join(pk)
+    update_cols = [column for column in columns if column not in pk]
+    if update_cols:
+        update_set = ", ".join(f"{column} = EXCLUDED.{column}" for column in update_cols)
+        return (
+            f"INSERT INTO {pg_table} ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT ({pk_list}) DO UPDATE SET {update_set}"
+        )
+    return f"INSERT INTO {pg_table} ({col_list}) VALUES ({placeholders}) ON CONFLICT ({pk_list}) DO NOTHING"
+
+
+def _insert_result_batches(
+    cur,
+    result,
+    first_batch: list[tuple],
+    *,
+    duck_table: str,
+    pg_table: str,
+    columns: list[str],
+    keep_idx: list[int] | None,
+    pk: list[str],
+    sql: str,
+) -> tuple[int, int, int]:
+    total_rows = 0
+    fetch_batch_count = 0
+    dropped_duplicate_rows = 0
+    raw_rows = first_batch
+
+    while raw_rows:
+        fetch_batch_count += 1
+        ts_indexes = _detect_datetime_indexes(raw_rows)
+        rows = _normalize_batch_rows(raw_rows, ts_indexes, keep_idx)
+        rows, duplicate_count = _deduplicate_rows_by_pk(rows, columns, pk)
+        dropped_duplicate_rows += duplicate_count
+        if duplicate_count > 0:
+            logger.warning(
+                "  %s → %s: dropped %s duplicate rows for PK %s before batch upsert",
+                duck_table,
+                pg_table,
+                duplicate_count,
+                ", ".join(pk),
+            )
+
+        if rows:
+            psycopg2.extras.execute_values(
+                cur,
+                sql.replace("VALUES (" + ", ".join(["%s"] * len(columns)) + ")", "VALUES %s"),
+                rows,
+                page_size=PG_SYNC_BATCH_SIZE,
+            )
+            total_rows += len(rows)
+
+        raw_rows = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
+
+    return total_rows, fetch_batch_count, dropped_duplicate_rows
+
+
+def _sync_partitioned_full_refresh(
+    duck: duckdb.DuckDBPyConnection,
+    pg_conn,
+    duck_table: str,
+    config: dict,
+) -> int:
+    started_at = time.time()
+    pg_table = config["pg_table"]
+    pk = config["pk"]
+    partitions = duck.execute(config["full_refresh_partition_values_sql"]).fetchall()
+    if not partitions:
+        logger.info("  %s → 无分片数据", duck_table)
+        return 0
+
+    total_rows = 0
+    failed_partitions = 0
+    for domain, start_date, end_date in partitions:
+        partition_label = f"domain={domain} month={start_date}"
+        try:
+            query = _build_partitioned_agg_select(config, int(domain), start_date, end_date)
+            result = duck.execute(query)
+            _, keep_idx, columns = _prepare_result_columns(result, config)
+            first_batch = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
+            sql = _build_pg_insert_sql(pg_table, columns, pk)
+
+            with pg_conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {pg_table} WHERE domain = %s AND date >= %s AND date < %s",
+                    [domain, start_date, end_date],
+                )
+                if first_batch:
+                    rows, fetch_batches, dropped_duplicates = _insert_result_batches(
+                        cur,
+                        result,
+                        first_batch,
+                        duck_table=duck_table,
+                        pg_table=pg_table,
+                        columns=columns,
+                        keep_idx=keep_idx,
+                        pk=pk,
+                        sql=sql,
+                    )
+                    total_rows += rows
+                    duplicate_suffix = ""
+                    if dropped_duplicates > 0:
+                        duplicate_suffix = f", dropped {dropped_duplicates} duplicate rows"
+                    logger.info(
+                        "  %s → %s [%s]: %s rows across %s fetch batches%s",
+                        duck_table,
+                        pg_table,
+                        partition_label,
+                        rows,
+                        fetch_batches,
+                        duplicate_suffix,
+                    )
+                else:
+                    logger.info("  %s → %s [%s]: 无数据", duck_table, pg_table, partition_label)
+            pg_conn.commit()
+        except Exception as exc:
+            pg_conn.rollback()
+            failed_partitions += 1
+            logger.warning("  %s → %s [%s] 失败: %s", duck_table, pg_table, partition_label, exc)
+
+    elapsed = round(time.time() - started_at, 1)
+    logger.info(
+        "  %s → %s: partitioned full refresh wrote %s rows in %ss (%s partitions, %s failed)",
+        duck_table,
+        pg_table,
+        total_rows,
+        elapsed,
+        len(partitions),
+        failed_partitions,
+    )
+    if failed_partitions:
+        raise RuntimeError(f"{duck_table} partitioned full refresh failed for {failed_partitions} partitions")
+    return total_rows
+
+
 def sync_table(
     duck: duckdb.DuckDBPyConnection,
     pg_conn,
@@ -520,6 +707,9 @@ def sync_table(
     pk = config["pk"]
     ts_col = config["timestamp_col"]
     effective_full = full or config.get("always_full_refresh", False)
+    if effective_full and config.get("full_refresh_partition_values_sql") and config.get("duck_sql_template"):
+        return _sync_partitioned_full_refresh(duck, pg_conn, duck_table, config)
+
     base_query = _build_duck_select(duck_source=duck_table, config=config)
     filtered_query = base_query
     if config.get("where_clause"):

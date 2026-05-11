@@ -99,6 +99,7 @@ ExecStartPre=/bin/mkdir -p $DEFAULT_LOG_DIR
 ExecStart=$(exec_start_for "$job")
 Restart=always
 RestartSec=10
+TimeoutStopSec=10min
 StandardOutput=append:$(log_file_for "$job")
 StandardError=append:$(log_file_for "$job")
 

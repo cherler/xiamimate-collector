@@ -56,6 +56,38 @@ from .token_allocator import KeepaTokenAllocator
 
 logger = logging.getLogger(__name__)
 
+_SHUTDOWN_REQUESTED = False
+
+
+def _install_shutdown_handler() -> None:
+    signal.signal(signal.SIGTERM, _request_shutdown)
+
+
+def _request_shutdown(signum, frame) -> None:
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    try:
+        signal_name = signal.Signals(signum).name
+    except ValueError:
+        signal_name = str(signum)
+    logger.info("=== 收到 %s, 正在退出 ===", signal_name)
+    raise KeyboardInterrupt
+
+
+def _raise_if_shutdown_requested() -> None:
+    if _SHUTDOWN_REQUESTED:
+        raise KeyboardInterrupt
+
+
+def _sleep_until_shutdown_or_timeout(seconds: float) -> None:
+    deadline = time.time() + max(0.0, seconds)
+    while True:
+        _raise_if_shutdown_requested()
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
+
 
 def _utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1762,19 +1794,75 @@ class AutoCollector:
         """Lazy init GoogleTrendsCollector (按 domain 设置正确的 hl)."""
         if self._trends_collector is None:
             try:
-                from .collectors import GoogleTrendsCollector
-                hl = self._DOMAIN_TO_HL.get(self.domain, "en-US")
-                proxy_url = (
-                    os.environ.get("GOOGLE_TRENDS_PROXY_URL")
-                    or os.environ.get("AUTO_COLLECT_GOOGLE_TRENDS_PROXY_URL")
-                    or ""
-                ).strip()
-                if proxy_url:
-                    logger.info("Google Trends 使用显式代理: %s", self._redact_proxy_url(proxy_url))
-                self._trends_collector = GoogleTrendsCollector(hl=hl, proxy_url=proxy_url or None)
+                self._trends_collector = self._create_trends_collector()
             except ImportError:
                 logger.warning("GoogleTrendsCollector 不可用 (pytrends 未安装)")
+            except Exception as e:
+                self._trends_collector = None
+                reason = str(e).splitlines()[0][:180]
+                switched = self._rotate_google_trends_proxy_node()
+                if switched:
+                    try:
+                        self._trends_collector = self._create_trends_collector()
+                        logger.info("GoogleTrendsCollector 切换 Mihomo 节点后初始化成功")
+                        return self._trends_collector
+                    except Exception as retry_error:
+                        self._trends_collector = None
+                        reason = str(retry_error).splitlines()[0][:180]
+                self._pause_google_trends(reason)
+                logger.warning(
+                    "GoogleTrendsCollector 初始化失败，%s，已进入冷却: %s",
+                    "已尝试切换 Mihomo 节点" if switched else "未切换节点",
+                    reason,
+                )
         return self._trends_collector
+
+    def _create_trends_collector(self):
+        from .collectors import GoogleTrendsCollector
+
+        hl = self._DOMAIN_TO_HL.get(self.domain, "en-US")
+        proxy_url = (
+            os.environ.get("GOOGLE_TRENDS_PROXY_URL")
+            or os.environ.get("AUTO_COLLECT_GOOGLE_TRENDS_PROXY_URL")
+            or ""
+        ).strip()
+        if proxy_url:
+            logger.info("Google Trends 使用显式代理: %s", self._redact_proxy_url(proxy_url))
+
+        connect_timeout = self._env_float(
+            "AUTO_GOOGLE_TRENDS_CONNECT_TIMEOUT_SECONDS",
+            self._env_float("GOOGLE_TRENDS_CONNECT_TIMEOUT_SECONDS", 5.0),
+        )
+        read_timeout = self._env_float(
+            "AUTO_GOOGLE_TRENDS_READ_TIMEOUT_SECONDS",
+            self._env_float("GOOGLE_TRENDS_READ_TIMEOUT_SECONDS", 20.0),
+        )
+        retries = self._env_int("AUTO_GOOGLE_TRENDS_RETRIES", self._env_int("GOOGLE_TRENDS_RETRIES", 0))
+        backoff_factor = self._env_float(
+            "AUTO_GOOGLE_TRENDS_BACKOFF_FACTOR",
+            self._env_float("GOOGLE_TRENDS_BACKOFF_FACTOR", 0.0),
+        )
+        return GoogleTrendsCollector(
+            hl=hl,
+            proxy_url=proxy_url or None,
+            timeout=(max(0.5, connect_timeout), max(1.0, read_timeout)),
+            retries=max(0, retries),
+            backoff_factor=max(0.0, backoff_factor),
+        )
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
 
     @staticmethod
     def _redact_proxy_url(proxy_url: str) -> str:
@@ -1868,8 +1956,13 @@ class AutoCollector:
 
         try:
             proxies = self._mihomo_request("GET", "/proxies")
-            group = proxies.get("proxies", {}).get(self.google_trends_mihomo_switch_group) or {}
-            candidates = [name for name in group.get("all", []) if name and name not in {"DIRECT", "REJECT"}]
+            proxy_map = proxies.get("proxies", {})
+            group = proxy_map.get(self.google_trends_mihomo_switch_group) or {}
+            candidates = [
+                name
+                for name in group.get("all", [])
+                if name and name not in {"DIRECT", "REJECT"} and not (proxy_map.get(name) or {}).get("all")
+            ]
             if len(candidates) < 2:
                 logger.info(
                     "Google Trends Mihomo 分组 %s 可切换候选不足，跳过切节点",
@@ -1902,11 +1995,7 @@ class AutoCollector:
             return False
 
     def _handle_google_trends_error(self, batch: list[str], exc: Exception, *, prefix: str, batches_done: int) -> bool:
-        err_str = str(exc).lower()
-        should_pause = any(
-            marker in err_str
-            for marker in ["429", "too many", "rate", "network is unreachable", "timed out", "timeout"]
-        )
+        should_pause = self._is_google_trends_rate_error(exc) or self._is_google_trends_transport_error(exc)
         if should_pause:
             self._trends_keyword_queue = batch + self._trends_keyword_queue
             reason = str(exc).splitlines()[0][:180]
@@ -1924,6 +2013,55 @@ class AutoCollector:
         logger.warning("%s Google Trends %s 失败: %s", prefix, batch, exc)
         self._trends_fetched_keywords.update(batch)
         return False
+
+    @staticmethod
+    def _is_google_trends_rate_error(exc: Exception) -> bool:
+        err_str = str(exc).lower()
+        return any(marker in err_str for marker in ["429", "too many", "rate"])
+
+    @staticmethod
+    def _is_google_trends_transport_error(exc: Exception) -> bool:
+        err_str = str(exc).lower()
+        return any(
+            marker in err_str
+            for marker in [
+                "network is unreachable",
+                "timed out",
+                "timeout",
+                "proxyerror",
+                "cannot connect to proxy",
+                "ssl",
+                "handshake",
+                "unexpected eof",
+                "connection reset",
+            ]
+        )
+
+    def _fetch_trends_batch(self, *, batch: list[str], geo: str) -> list[dict]:
+        collector = self._get_trends_collector()
+        if collector is None:
+            return []
+
+        try:
+            return collector.fetch_interest_over_time(
+                keywords=batch,
+                timeframe=self._trends_timeframe(),
+                geo=geo,
+            )
+        except Exception as exc:
+            if self._is_google_trends_rate_error(exc) or not self._is_google_trends_transport_error(exc):
+                raise
+            reason = str(exc).splitlines()[0][:180]
+            switched = self._rotate_google_trends_proxy_node()
+            if not switched:
+                raise
+            self._trends_collector = self._create_trends_collector()
+            logger.info("Google Trends 网络异常，已切换 Mihomo 节点后重试: %s", reason)
+            return self._trends_collector.fetch_interest_over_time(
+                keywords=batch,
+                timeframe=self._trends_timeframe(),
+                geo=geo,
+            )
 
     def _fetch_trends_during_wait(self, wait_secs: float) -> None:
         """在 token 等待期间采集 Google Trends (免费, 不消耗 Keepa token).
@@ -1967,11 +2105,7 @@ class AutoCollector:
             self._trends_keyword_queue = self._trends_keyword_queue[self.google_trends_batch_size :]
 
             try:
-                trend_rows = collector.fetch_interest_over_time(
-                    keywords=batch,
-                    timeframe=self._trends_timeframe(),
-                    geo=geo,
-                )
+                trend_rows = self._fetch_trends_batch(batch=batch, geo=geo)
                 if trend_rows:
                     ingested = self.storage.ingest_google_trends(trend_rows)
                     self._stats["trends_rows_ingested"] += ingested
@@ -2071,11 +2205,7 @@ class AutoCollector:
 
                 batch = keywords_list[i : i + self.google_trends_batch_size]
                 try:
-                    trend_rows = trends_collector.fetch_interest_over_time(
-                        keywords=batch,
-                        timeframe=self._trends_timeframe(),
-                        geo=geo,
-                    )
+                    trend_rows = self._fetch_trends_batch(batch=batch, geo=geo)
                     if trend_rows:
                         ingested = self.storage.ingest_google_trends(trend_rows)
                         self._stats["trends_rows_ingested"] += ingested
@@ -2311,6 +2441,7 @@ def run_auto_collect_loop(
     logger.info(
         f"=== 进入持续采集模式 === 轮间等待 {interval_minutes} 分钟, Ctrl-C 退出"
     )
+    _install_shutdown_handler()
 
     collect_kwargs = dict(
         keepa_api_key=keepa_api_key,
@@ -2333,11 +2464,13 @@ def run_auto_collect_loop(
 
     try:
         while True:
+            _raise_if_shutdown_requested()
             round_num += 1
             logger.info(f"--- 第 {round_num} 轮采集 ---")
 
             try:
                 stats = run_auto_collect(**collect_kwargs)
+                _raise_if_shutdown_requested()
                 total_asins += stats.get("asins_fetched", 0)
                 total_tokens += stats.get("tokens_consumed", 0)
 
@@ -2347,8 +2480,12 @@ def run_auto_collect_loop(
                     f"消耗 {stats.get('tokens_consumed', 0)} token | "
                     f"累计 {total_asins} ASIN, {total_tokens} token"
                 )
-            except Exception as e:
-                logger.error(f"第 {round_num} 轮出错 (不退出, 等待下一轮): {e}", exc_info=True)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                if _SHUTDOWN_REQUESTED:
+                    raise KeyboardInterrupt
+                logger.error(f"第 {round_num} 轮出错 (不退出, 等待下一轮): {exc}", exc_info=True)
 
             # 等待下一轮
             next_run = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -2356,7 +2493,7 @@ def run_auto_collect_loop(
                 f"等待 {interval_minutes} 分钟后开始第 {round_num + 1} 轮... "
                 f"(当前 UTC {next_run})"
             )
-            time.sleep(interval_minutes * 60)
+            _sleep_until_shutdown_or_timeout(interval_minutes * 60)
 
     except KeyboardInterrupt:
         logger.info(
@@ -2396,12 +2533,7 @@ def run_multi_domain_collect_loop(
     target_domains = domains or ALL_DOMAINS
     geo_names = {d: KEEPA_DOMAIN_TO_GEO.get(d, "?") for d in target_domains}
 
-    # SIGTERM 优雅退出: macOS 休眠 / launchd stop 会发 SIGTERM
-    def _handle_sigterm(signum, frame):
-        logger.info("=== 收到 SIGTERM, 正在退出 ===")
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    _install_shutdown_handler()
 
     logger.info(
         f"=== 多站点持续采集 (逐站点完成所有 L1) === {len(target_domains)} 个 domain: "
@@ -2431,10 +2563,12 @@ def run_multi_domain_collect_loop(
 
     try:
         while True:
+            _raise_if_shutdown_requested()
             round_num += 1
             logger.info(f"--- 第 {round_num} 轮 (全站点) ---")
 
             for domain in target_domains:
+                _raise_if_shutdown_requested()
                 geo = geo_names[domain]
                 logger.info(
                     f"  >> Domain {domain}/{geo} 开始 (完成所有 L1 类目后再切换)"
@@ -2444,6 +2578,7 @@ def run_multi_domain_collect_loop(
                 l1_round = 0
 
                 while True:
+                    _raise_if_shutdown_requested()
                     l1_round += 1
 
                     try:
@@ -2451,6 +2586,7 @@ def run_multi_domain_collect_loop(
                             domain=domain,
                             **collect_kwargs,
                         )
+                        _raise_if_shutdown_requested()
                         fetched = stats.get("asins_fetched", 0)
                         consumed = stats.get("tokens_consumed", 0)
                         domain_asins += fetched
@@ -2482,15 +2618,19 @@ def run_multi_domain_collect_loop(
                                 f"本次无新发现或采集 (可能 token 不足), "
                                 f"等待 {interval_minutes} 分钟后重试"
                             )
-                            time.sleep(interval_minutes * 60)
+                            _sleep_until_shutdown_or_timeout(interval_minutes * 60)
 
-                    except Exception as e:
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:
+                        if _SHUTDOWN_REQUESTED:
+                            raise KeyboardInterrupt
                         logger.error(
-                            f"  !! Domain {domain}/{geo} 第 {l1_round} 次出错: {e}",
+                            f"  !! Domain {domain}/{geo} 第 {l1_round} 次出错: {exc}",
                             exc_info=True,
                         )
                         # 出错后等一会再重试, 不立刻切域
-                        time.sleep(60)
+                        _sleep_until_shutdown_or_timeout(60)
                         # 连续出错多次则跳过该 domain
                         if l1_round >= 3 and domain_asins == 0:
                             logger.error(
@@ -2511,7 +2651,7 @@ def run_multi_domain_collect_loop(
                 f"等待 {interval_minutes} 分钟后开始第 {round_num + 1} 轮... "
                 f"(当前 UTC {next_run})"
             )
-            time.sleep(interval_minutes * 60)
+            _sleep_until_shutdown_or_timeout(interval_minutes * 60)
 
     except (KeyboardInterrupt, SystemExit):
         logger.info(
