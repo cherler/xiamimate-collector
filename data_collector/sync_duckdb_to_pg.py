@@ -270,13 +270,25 @@ def acquire_process_lock(lock_path: str | Path):
     """Acquire a non-blocking file lock so only one sync process can run."""
     path = Path(lock_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("w", encoding="utf-8")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        sys.exit(f"同步进程已在运行, 请勿重复启动: {path}")
+        timeout_seconds = max(0, int(os.environ.get("PG_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS", "0") or "0"))
+    except ValueError:
+        sys.exit("PG_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS must be a non-negative integer")
 
+    handle = path.open("a+", encoding="utf-8")
+    started_at = time.time()
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if timeout_seconds <= 0 or time.time() - started_at >= timeout_seconds:
+                handle.close()
+                sys.exit(f"同步进程已在运行, 请勿重复启动: {path}")
+            time.sleep(2)
+
+    handle.seek(0)
+    handle.truncate()
     handle.write(f"pid={os.getpid()}\n")
     handle.flush()
     return handle
@@ -975,6 +987,11 @@ def _trigger_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) 
         "  expansion jobs: triggering theme feature sync after %s completed jobs",
         completed_count,
     )
+    configured_lock_mode = os.environ.get("PG_SYNC_TRIGGER_THEME_SYNC_DUCKDB_LOCK_MODE", "").strip().lower()
+    if configured_lock_mode:
+        duckdb_lock_mode = configured_lock_mode
+    else:
+        duckdb_lock_mode = "acquire"
     try:
         subprocess.run(
             ["/bin/bash", str(THEME_SYNC_TRIGGER_SCRIPT)],
@@ -986,6 +1003,7 @@ def _trigger_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) 
                 "PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE": "false",
                 "CANDIDATE_EXPANSION_JOB_IDS": ",".join(completed_job_ids),
                 "CANDIDATE_EXPANSION_DUCKDB_SOURCE": "live",
+                "CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE": duckdb_lock_mode,
                 "CANDIDATE_EXPANSION_REFRESH_SNAPSHOT": "false",
             },
         )
@@ -1000,6 +1018,23 @@ def _trigger_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) 
         return False
 
     logger.info("  expansion jobs: theme feature sync trigger completed")
+    return True
+
+
+def _defer_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) -> bool:
+    """Write completed expansion job ids for the shell wrapper to trigger after lock release."""
+    output_path_raw = os.environ.get("PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE", "").strip()
+    if not output_path_raw:
+        return False
+
+    output_path = Path(output_path_raw).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(completed_job_ids) + ("\n" if completed_job_ids else ""), encoding="utf-8")
+    if completed_job_ids:
+        logger.info(
+            "  expansion jobs: deferred theme feature sync trigger for %s completed jobs",
+            len(completed_job_ids),
+        )
     return True
 
 
@@ -1061,9 +1096,12 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
 
     _save_sync_state(state_path, sync_state)
 
-    results["serving.theme_feature_sync:triggered"] = int(
-        _trigger_theme_sync_after_expansion_reconcile(reconciled_expansion_job_ids)
-    )
+    if _defer_theme_sync_after_expansion_reconcile(reconciled_expansion_job_ids):
+        results["serving.theme_feature_sync:triggered"] = 0
+    else:
+        results["serving.theme_feature_sync:triggered"] = int(
+            _trigger_theme_sync_after_expansion_reconcile(reconciled_expansion_job_ids)
+        )
 
     elapsed = round(time.time() - start, 1)
     total = sum(v for v in results.values() if v > 0)

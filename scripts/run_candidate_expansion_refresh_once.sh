@@ -11,6 +11,7 @@ LOG_DIR="${XIAMIMATE_LOG_DIR:-$ROOT_DIR/logs}"
 CANDIDATE_EXPANSION_DUCKDB_SOURCE="${CANDIDATE_EXPANSION_DUCKDB_SOURCE:-live}"
 DUCKDB_ACCESS_LOCK_FILE="${XIAMIMATE_DUCKDB_ACCESS_LOCK_FILE:-$LOG_DIR/duckdb_live_access.lock}"
 DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS="${CANDIDATE_EXPANSION_DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS:-${XIAMIMATE_DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS:-900}}"
+CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE="${CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE:-acquire}"
 mkdir -p "$LOG_DIR"
 
 cleanup_subset_duckdb() {
@@ -40,6 +41,14 @@ fi
 
 export CANDIDATE_EXPANSION_JOB_IDS="$job_ids"
 
+build_live_subset_duckdb() {
+    eval "$("$PYTHON_BIN" "$ROOT_DIR/scripts/build_candidate_expansion_duckdb_subset.py" \
+        --source-db "$LIVE_DUCKDB_PATH" \
+        --output-dir "$subset_dir" \
+        --job-ids "$job_ids" \
+        --emit-shell)"
+}
+
 case "$CANDIDATE_EXPANSION_DUCKDB_SOURCE" in
     live)
         LIVE_DUCKDB_PATH="${CANDIDATE_EXPANSION_LIVE_DUCKDB_PATH:-${XIAMIMATE_DUCKDB_PATH:-}}"
@@ -49,20 +58,28 @@ case "$CANDIDATE_EXPANSION_DUCKDB_SOURCE" in
         fi
         subset_dir="${CANDIDATE_EXPANSION_DUCKDB_SUBSET_DIR:-$LOG_DIR/candidate_expansion_duckdb_subsets}"
         mkdir -p "$(dirname "$DUCKDB_ACCESS_LOCK_FILE")"
-        {
-            if ! flock -x -w "$DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS" 8; then
-                echo "candidate expansion refresh: timed out waiting for DuckDB access lock: $DUCKDB_ACCESS_LOCK_FILE" >&2
+        case "$CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE" in
+            acquire)
+                {
+                    if ! flock -x -w "$DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS" 8; then
+                        echo "candidate expansion refresh: timed out waiting for DuckDB access lock: $DUCKDB_ACCESS_LOCK_FILE" >&2
+                        exit 1
+                    fi
+                    printf 'pid=%s\nrole=candidate_expansion_subset\nacquired_at=%s\n' "$$" "$(date -u +%FT%TZ)" >"$DUCKDB_ACCESS_LOCK_FILE"
+                    build_live_subset_duckdb
+                    : >"$DUCKDB_ACCESS_LOCK_FILE"
+                    flock -u 8
+                } 8>"$DUCKDB_ACCESS_LOCK_FILE"
+                ;;
+            inherit)
+                echo "candidate expansion refresh: using caller-held DuckDB access lock: $DUCKDB_ACCESS_LOCK_FILE"
+                build_live_subset_duckdb
+                ;;
+            *)
+                echo "candidate expansion refresh: unsupported CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE=$CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE (expected acquire|inherit)" >&2
                 exit 1
-            fi
-            printf 'pid=%s\nrole=candidate_expansion_subset\nacquired_at=%s\n' "$$" "$(date -u +%FT%TZ)" >"$DUCKDB_ACCESS_LOCK_FILE"
-            eval "$("$PYTHON_BIN" "$ROOT_DIR/scripts/build_candidate_expansion_duckdb_subset.py" \
-                --source-db "$LIVE_DUCKDB_PATH" \
-                --output-dir "$subset_dir" \
-                --job-ids "$job_ids" \
-                --emit-shell)"
-            : >"$DUCKDB_ACCESS_LOCK_FILE"
-            flock -u 8
-        } 8>"$DUCKDB_ACCESS_LOCK_FILE"
+                ;;
+        esac
         if [[ -z "${CANDIDATE_EXPANSION_SUBSET_DUCKDB_PATH:-}" ]]; then
             echo "candidate expansion refresh: no ASINs found for job ids: $job_ids"
             exit 0
@@ -88,6 +105,8 @@ export PG_SYNC_TABLES="${CANDIDATE_EXPANSION_PG_SYNC_TABLES:-curated.keepa_asin_
 export PG_SYNC_SKIP_TABLES=""
 export PG_SYNC_REFRESH_SNAPSHOT="${CANDIDATE_EXPANSION_REFRESH_SNAPSHOT:-false}"
 export PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE=false
+export PG_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS="${CANDIDATE_EXPANSION_PG_PROCESS_LOCK_TIMEOUT_SECONDS:-${PG_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS:-900}}"
+export THEME_FEATURE_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS="${CANDIDATE_EXPANSION_THEME_PROCESS_LOCK_TIMEOUT_SECONDS:-${THEME_FEATURE_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS:-900}}"
 
 if [[ "${CANDIDATE_EXPANSION_RUN_PG_SYNC:-true}" == "true" ]]; then
     /bin/bash "$ROOT_DIR/scripts/run_pg_sync_once.sh"

@@ -123,6 +123,7 @@ ECS2 cutover 说明：
 2. `auto-collect` 通过 `scripts/run_auto_collect_foreground.sh` 以前台方式交给 systemd 托管；崩溃后由 systemd 重启。
 3. `pg-sync` 与 `theme-sync` 通过 `scripts/run_pg_sync_loop.sh`、`scripts/run_theme_sync_loop.sh` 按“单次执行 + sleep”循环运行，沿用现有 `run_*_once.sh` 的业务入口，不重写同步逻辑。
 4. ECS2 推荐直接写 PostgreSQL 目标库，默认 `PG_TUNNEL_ENABLED=0`；只有 ECS2 到目标库仍然不通时，才再切回 SSH 隧道模式。
+5. ECS2 的 live DuckDB 锁、PG/theme 定时任务互斥、补池 completed 后 scoped serving sync 的触发关系见 `doc/duckdb-locking-and-sync-orchestration.md`。
 
 SSH 隧道同步模式：
 
@@ -139,7 +140,7 @@ SSH 隧道同步模式：
    - `theme-api`: 建议 `PG_PORT=15435`
    - `chat-backend`: 建议 `PG_PORT=15436`
 4. 启用后，各同步任务会在每一轮真正执行前确保自己的 SSH 隧道可用；默认 keepalive，不在每轮结束后关闭。只有显式设置 `THEME_FEATURE_SYNC_TUNNEL_KEEPALIVE=false` 时，theme-sync 才会按单次任务生命周期关闭自己的隧道。
-5. 当 `pg sync` 将补池任务从 `syncing` 协调为 `completed` 后，会自动触发一次 `theme feature sync`，让 `serving.theme_base_daily` 尽快追上最新补池 ASIN。触发的 theme-sync 使用 `THEME_FEATURE_SYNC_TUNNEL_LOCAL_PORT`。
+5. 当 `pg sync` 将补池任务从 `syncing` 协调为 `completed` 后，外层 `run_pg_sync_once.sh` 会在释放 live DuckDB 锁后触发一次补池 scoped refresh，让 `serving.theme_base_daily` 尽快追上最新补池 ASIN。互斥细节见 `doc/duckdb-locking-and-sync-orchestration.md`。
 6. auto-collect 的通用隧道也可以单独管理：
    - `bash scripts/manage_pg_ssh_tunnel.sh preview`
    - `bash scripts/manage_pg_ssh_tunnel.sh status`

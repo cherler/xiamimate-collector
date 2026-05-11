@@ -337,13 +337,25 @@ def get_pg_conn():
 def acquire_process_lock(lock_path: str | Path):
     path = Path(lock_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("w", encoding="utf-8")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        sys.exit(f"主题特征同步进程已在运行, 请勿重复启动: {path}")
+        timeout_seconds = max(0, int(os.environ.get("THEME_FEATURE_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS", "0") or "0"))
+    except ValueError:
+        sys.exit("THEME_FEATURE_SYNC_PROCESS_LOCK_TIMEOUT_SECONDS must be a non-negative integer")
 
+    handle = path.open("a+", encoding="utf-8")
+    started_at = time.time()
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if timeout_seconds <= 0 or time.time() - started_at >= timeout_seconds:
+                handle.close()
+                sys.exit(f"主题特征同步进程已在运行, 请勿重复启动: {path}")
+            time.sleep(2)
+
+    handle.seek(0)
+    handle.truncate()
     handle.write(f"pid={os.getpid()}\n")
     handle.flush()
     return handle

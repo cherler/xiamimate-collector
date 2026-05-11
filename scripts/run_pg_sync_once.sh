@@ -24,6 +24,8 @@ INCLUDE_HISTORY="${PG_SYNC_INCLUDE_HISTORY:-true}"
 DUCKDB_ACCESS_LOCK_FILE="${PG_SYNC_DUCKDB_ACCESS_LOCK_FILE:-${XIAMIMATE_DUCKDB_ACCESS_LOCK_FILE:-}}"
 DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS="${PG_SYNC_DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS:-${XIAMIMATE_DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS:-900}}"
 DUCKDB_ACCESS_LOCK_ACQUIRED="false"
+DEFER_THEME_SYNC_TRIGGER="false"
+RECONCILED_EXPANSION_JOB_IDS_FILE=""
 
 mkdir -p "$LOG_DIR"
 
@@ -51,7 +53,19 @@ cleanup_duckdb_access_lock() {
     if [[ "$DUCKDB_ACCESS_LOCK_ACQUIRED" == "true" && -n "$DUCKDB_ACCESS_LOCK_FILE" ]]; then
         : >"$DUCKDB_ACCESS_LOCK_FILE" || true
         flock -u 8 >/dev/null 2>&1 || true
+        DUCKDB_ACCESS_LOCK_ACQUIRED="false"
     fi
+}
+
+env_flag_enabled() {
+    case "${1:-true}" in
+        0|false|False|FALSE|no|No|NO|off|Off|OFF)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
 }
 
 acquire_duckdb_access_lock() {
@@ -146,6 +160,14 @@ if collector_pg_tunnel_enabled; then
     export PG_PORT="$PG_SYNC_TUNNEL_LOCAL_PORT_VALUE"
 fi
 
+if env_flag_enabled "${PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE:-true}" && env_flag_enabled "${PG_SYNC_DEFER_THEME_SYNC_TRIGGER:-true}"; then
+    DEFER_THEME_SYNC_TRIGGER="true"
+    RECONCILED_EXPANSION_JOB_IDS_FILE="$LOG_DIR/reconciled_expansion_job_ids.$$"
+    : >"$RECONCILED_EXPANSION_JOB_IDS_FILE"
+    export PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE="$RECONCILED_EXPANSION_JOB_IDS_FILE"
+    export PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE=false
+fi
+
 cmd=(
     "$PYTHON_BIN"
     "$SYNC_SCRIPT"
@@ -156,4 +178,31 @@ if [[ -n "$DUCKDB_PATH" ]]; then
     cmd+=(--duckdb-path "$DUCKDB_PATH")
 fi
 
+set +e
 "${cmd[@]}"
+sync_status=$?
+set -e
+
+cleanup_duckdb_access_lock
+
+if [[ "$sync_status" -ne 0 ]]; then
+    if [[ -n "$RECONCILED_EXPANSION_JOB_IDS_FILE" ]]; then
+        rm -f "$RECONCILED_EXPANSION_JOB_IDS_FILE"
+    fi
+    exit "$sync_status"
+fi
+
+if [[ "$DEFER_THEME_SYNC_TRIGGER" == "true" && -s "$RECONCILED_EXPANSION_JOB_IDS_FILE" ]]; then
+    job_ids="$(tr '\n' ',' <"$RECONCILED_EXPANSION_JOB_IDS_FILE" | sed 's/,$//')"
+    if [[ -n "$job_ids" ]]; then
+        echo "pg-sync triggering candidate expansion scoped serving refresh after releasing DuckDB lock: $job_ids"
+        CANDIDATE_EXPANSION_JOB_IDS="$job_ids" \
+        CANDIDATE_EXPANSION_DUCKDB_SOURCE=live \
+        CANDIDATE_EXPANSION_REFRESH_SNAPSHOT=false \
+        /bin/bash "$ROOT_DIR/scripts/run_candidate_expansion_refresh_once.sh"
+    fi
+fi
+
+if [[ -n "$RECONCILED_EXPANSION_JOB_IDS_FILE" ]]; then
+    rm -f "$RECONCILED_EXPANSION_JOB_IDS_FILE"
+fi
