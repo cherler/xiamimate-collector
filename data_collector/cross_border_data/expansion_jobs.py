@@ -58,6 +58,51 @@ class ExpansionJobStore:
             raise RuntimeError("PostgreSQL expansion job queue is not configured")
         return psycopg2.connect(**pg_connection_config())
 
+    def peek_next_interactive_job_domain(self, *, domains: list[int] | None = None) -> int | None:
+        if not self.enabled:
+            return None
+        normalized_domains = sorted({int(domain) for domain in domains or []})
+        if domains is not None and not normalized_domains:
+            return None
+        conn = self._connect()
+        try:
+            with conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                    params: list[Any] = []
+                    domain_filter = ""
+                    if normalized_domains:
+                        domain_filter = "AND domain = ANY(%s)"
+                        params.append(normalized_domains)
+                    cursor.execute(
+                        f"""
+                        SELECT domain
+                        FROM sync.keepa_candidate_expansion_jobs
+                        WHERE priority IN ('interactive_high', 'interactive_normal')
+                          AND status IN ('hydrating', 'queued', 'waiting_token')
+                          {domain_filter}
+                        ORDER BY
+                          CASE status
+                            WHEN 'hydrating' THEN 1
+                            WHEN 'queued' THEN 2
+                            WHEN 'waiting_token' THEN 3
+                            ELSE 4
+                          END,
+                          CASE priority
+                            WHEN 'interactive_high' THEN 1
+                            WHEN 'interactive_normal' THEN 2
+                            ELSE 3
+                          END,
+                          updated_at ASC NULLS LAST,
+                          created_at ASC
+                        LIMIT 1
+                        """,
+                        params,
+                    )
+                    row = cursor.fetchone()
+                    return int(row["domain"]) if row else None
+        finally:
+            conn.close()
+
     def claim_next_interactive_job(self, *, domain: int) -> ExpansionJob | None:
         if not self.enabled:
             return None

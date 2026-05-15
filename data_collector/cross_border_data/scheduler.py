@@ -447,6 +447,9 @@ class AutoCollector:
 
             # 0.2 交互式补池任务优先于后台 auto-collect discovery/history。
             self._run_interactive_expansion_job(tokens_left=tokens_left)
+            if self._stats.get("interactive_expansion_waiting_token"):
+                logger.info("补池任务等待 token, 本轮跳过后台采集阶段以保留 token 并快速释放 DuckDB 锁")
+                return self._finish(start_time)
 
             # 0.5 自动停用不活跃 ASIN
             self._auto_deactivate()
@@ -593,6 +596,7 @@ class AutoCollector:
                         tokens_left=tokens_left,
                         reason=decision.reason,
                     )
+                    self._stats["interactive_expansion_waiting_token"] = True
                     logger.info(f"补池任务 {job.job_id} 等待 token: {decision.reason}")
                     return
                 all_asins, raw_payload = self.discovery.fetch_best_sellers(
@@ -619,6 +623,7 @@ class AutoCollector:
                         tokens_left=tokens_left,
                         reason=decision.reason,
                     )
+                    self._stats["interactive_expansion_waiting_token"] = True
                     logger.info(f"补池任务 {job.job_id} 等待 token: {decision.reason}")
                     return
                 all_asins = self.discovery.search_products(
@@ -752,6 +757,7 @@ class AutoCollector:
                 tokens_left=tokens_left,
                 reason=decision.reason,
             )
+            self._stats["interactive_expansion_waiting_token"] = True
             logger.info(f"补池任务 {job.job_id} hydrate 等待 token: {decision.reason}")
             return
 
@@ -2544,6 +2550,7 @@ def run_multi_domain_collect_loop(
     round_num = 0
     total_asins = 0
     total_tokens = 0
+    expansion_job_store = ExpansionJobStore()
 
     collect_kwargs = dict(
         keepa_api_key=keepa_api_key,
@@ -2582,6 +2589,42 @@ def run_multi_domain_collect_loop(
                     l1_round += 1
 
                     try:
+                        preempt_domain = None
+                        try:
+                            preempt_domain = expansion_job_store.peek_next_interactive_job_domain(
+                                domains=target_domains,
+                            )
+                        except Exception as exc:
+                            logger.warning(f"读取全局补池抢占队列失败: {exc}")
+                        if preempt_domain is not None and preempt_domain != domain:
+                            preempt_geo = geo_names.get(preempt_domain, KEEPA_DOMAIN_TO_GEO.get(preempt_domain, "?"))
+                            logger.info(
+                                f"  !! 检测到 Domain {preempt_domain}/{preempt_geo} 交互式补池任务, "
+                                f"暂停 Domain {domain}/{geo} 普通采集并先处理补池"
+                            )
+                            preempt_stats = run_auto_collect(
+                                domain=preempt_domain,
+                                **collect_kwargs,
+                            )
+                            _raise_if_shutdown_requested()
+                            preempt_fetched = preempt_stats.get("asins_fetched", 0)
+                            preempt_discovered = preempt_stats.get("asins_discovered", 0)
+                            preempt_consumed = preempt_stats.get("tokens_consumed", 0)
+                            total_asins += preempt_fetched
+                            total_tokens += preempt_consumed
+                            logger.info(
+                                f"  !! Domain {preempt_domain}/{preempt_geo} 补池抢占轮完成: "
+                                f"发现 {preempt_discovered} ASIN, 采集 {preempt_fetched} ASIN, "
+                                f"消耗 {preempt_consumed} token"
+                            )
+                            if preempt_fetched == 0 and preempt_discovered == 0:
+                                logger.info(
+                                    f"  !! Domain {preempt_domain}/{preempt_geo} 补池抢占轮暂无进展, "
+                                    f"等待 {interval_minutes} 分钟后重试"
+                                )
+                                _sleep_until_shutdown_or_timeout(interval_minutes * 60)
+                            continue
+
                         stats = run_auto_collect(
                             domain=domain,
                             **collect_kwargs,

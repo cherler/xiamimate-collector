@@ -45,6 +45,41 @@ class FakeConnection:
         self.closed = True
 
 
+class FakePeekCursor:
+    def __init__(self) -> None:
+        self.statements: list[tuple[str, list[object] | None]] = []
+
+    def __enter__(self) -> "FakePeekCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+        return None
+
+    def execute(self, sql: str, params: list[object] | None = None) -> None:
+        self.statements.append((sql, params))
+
+    def fetchone(self) -> dict[str, object]:
+        return {"domain": "4"}
+
+
+class FakePeekConnection:
+    def __init__(self) -> None:
+        self.cursor_obj = FakePeekCursor()
+        self.closed = False
+
+    def __enter__(self) -> "FakePeekConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+        return None
+
+    def cursor(self, *args, **kwargs) -> FakePeekCursor:  # noqa: ANN002, ANN003
+        return self.cursor_obj
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class KeepaTokenAllocatorTests(unittest.TestCase):
     def test_pg_connection_config_prefers_tunnel_when_enabled(self) -> None:
         with patch.dict(
@@ -108,6 +143,32 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
         self.assertEqual(ledger_params[5], 12)
         self.assertEqual(ledger_params[7], 12)
         self.assertTrue(fake_conn.closed)
+
+    def test_peek_next_interactive_job_domain_filters_allowed_domains(self) -> None:
+        from data_collector.cross_border_data.expansion_jobs import ExpansionJobStore
+
+        store = ExpansionJobStore()
+        store.enabled = True
+        fake_conn = FakePeekConnection()
+        store._connect = lambda: fake_conn  # type: ignore[method-assign]
+
+        domain = store.peek_next_interactive_job_domain(domains=[4, 1, 1])
+
+        self.assertEqual(domain, 4)
+        executed_sql, params = fake_conn.cursor_obj.statements[0]
+        self.assertIn("status IN ('hydrating', 'queued', 'waiting_token')", executed_sql)
+        self.assertIn("domain = ANY(%s)", executed_sql)
+        self.assertEqual(params, [[1, 4]])
+        self.assertTrue(fake_conn.closed)
+
+    def test_peek_next_interactive_job_domain_empty_filter_skips_query(self) -> None:
+        from data_collector.cross_border_data.expansion_jobs import ExpansionJobStore
+
+        store = ExpansionJobStore()
+        store.enabled = True
+        store._connect = lambda: self.fail("empty domain filter should not connect")  # type: ignore[method-assign]
+
+        self.assertIsNone(store.peek_next_interactive_job_domain(domains=[]))
 
     def test_auto_discovery_keeps_interactive_reserve(self) -> None:
         allocator = KeepaTokenAllocator(
