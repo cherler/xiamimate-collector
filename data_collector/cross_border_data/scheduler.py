@@ -155,6 +155,7 @@ _EXCLUDED_CATEGORY_IDS = {
     133140011,    # Kindle Store
     2350149011,   # Apps & Games
     18145289011,  # Audible Books & Originals
+    283155,       # Books (US)
     9013971011,   # Video Shorts
     13727921011,  # Alexa Skills
     2858778011,   # Prime Video
@@ -257,7 +258,7 @@ class AutoCollector:
         domain: int = 1,
         min_tokens_reserve: int = 2,
         tokens_per_history: int = 2,
-        stale_hours: int = 336,
+        stale_hours: int = 1440,
         batch_size: int = 50,
         enable_google_trends: bool = True,
         enable_strategy_expansion: bool = False,
@@ -440,7 +441,7 @@ class AutoCollector:
             tokens_left = token_info.get("tokens_left", 0)
             self._stats["tokens_start"] = tokens_left
             logger.info(f"当前 token 余量: {tokens_left}")
-            interactive_pending = self.token_allocator.has_pending_interactive_jobs(domain=self.domain)
+            interactive_pending = self.token_allocator.has_pending_interactive_jobs()
             self._stats["interactive_expansion_pending"] = interactive_pending
             if interactive_pending:
                 logger.info("检测到交互式补池任务排队, auto-collect 将保留 token 并限制 history 消耗")
@@ -1182,7 +1183,7 @@ class AutoCollector:
                 self._fetch_trends_during_wait(wait_secs)
                 continue
 
-            interactive_pending = self.token_allocator.has_pending_interactive_jobs(domain=self.domain)
+            interactive_pending = self.token_allocator.has_pending_interactive_jobs()
             history_budget = self.token_allocator.history_token_budget(
                 tokens_left=tokens_left,
                 interactive_pending=interactive_pending,
@@ -2381,7 +2382,7 @@ def run_auto_collect(
     strategy_keyword_limit: int = 5,
     strategy_category_cooldown_hours: int = 24 * 30,
     strategy_keyword_cooldown_hours: int = 72,
-    stale_hours: int = 336,
+    stale_hours: int = 1440,
     batch_size: int = 50,
 ) -> dict[str, Any]:
     """启动一次自动采集, 供 CLI 调用."""
@@ -2429,7 +2430,7 @@ def run_auto_collect_loop(
     strategy_keyword_limit: int = 5,
     strategy_category_cooldown_hours: int = 24 * 30,
     strategy_keyword_cooldown_hours: int = 72,
-    stale_hours: int = 336,
+    stale_hours: int = 1440,
     batch_size: int = 50,
 ) -> None:
     """持续循环: 每隔 interval_minutes 运行一次 auto-collect.
@@ -2524,7 +2525,7 @@ def run_multi_domain_collect_loop(
     strategy_keyword_limit: int = 5,
     strategy_category_cooldown_hours: int = 24 * 30,
     strategy_keyword_cooldown_hours: int = 72,
-    stale_hours: int = 336,
+    stale_hours: int = 1440,
     batch_size: int = 50,
 ) -> None:
     """多 domain 持续采集: 逐个 domain 完成所有 L1 类目的 top100 商品采集后再切换下一个.

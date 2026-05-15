@@ -26,13 +26,13 @@ class TokenDecision:
 
 @dataclass(frozen=True)
 class KeepaTokenBudget:
-    interactive_min_tokens: int = 90
+    interactive_min_tokens: int = 150
     bestseller_min_tokens: int = 50
     search_min_tokens: int = 12
     history_min_tokens: int = 2
     safe_reserve_tokens: int = 20
     max_history_tokens_per_run: int = 200
-    pause_history_when_interactive_pending: bool = True
+    pause_history_when_interactive_pending: bool = False
     allow_discovery_with_pending: bool = True
 
     @classmethod
@@ -50,13 +50,13 @@ class KeepaTokenBudget:
             return raw.strip().lower() in {"1", "true", "yes", "on"}
 
         return cls(
-            interactive_min_tokens=_int("KEEPA_INTERACTIVE_MIN_TOKENS", 90),
+            interactive_min_tokens=_int("KEEPA_INTERACTIVE_MIN_TOKENS", 150),
             bestseller_min_tokens=_int("KEEPA_BESTSELLER_MIN_TOKENS", 50),
             search_min_tokens=_int("KEEPA_SEARCH_MIN_TOKENS", 12),
             history_min_tokens=_int("KEEPA_HISTORY_MIN_TOKENS", 2),
             safe_reserve_tokens=_int("KEEPA_SAFE_RESERVE_TOKENS", 20),
             max_history_tokens_per_run=_int("AUTO_COLLECT_MAX_HISTORY_TOKENS_PER_RUN", 200),
-            pause_history_when_interactive_pending=_bool("AUTO_HISTORY_PAUSE_WHEN_INTERACTIVE_PENDING", True),
+            pause_history_when_interactive_pending=_bool("AUTO_HISTORY_PAUSE_WHEN_INTERACTIVE_PENDING", False),
             allow_discovery_with_pending=_bool("AUTO_DISCOVERY_ALLOW_WHEN_PENDING", True),
         )
 

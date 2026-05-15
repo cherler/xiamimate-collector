@@ -157,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument("--search-term", action="append", default=[], help="搜索关键词, 可重复传入")
     auto.add_argument("--seed-file", help="ASIN 种子文件 CSV 路径")
     auto.add_argument("--db-path", help="DuckDB 文件路径 (默认使用 data_platform 下的)")
-    auto.add_argument("--stale-hours", type=int, default=336, help="未分层/非 P0-P2 ASIN 的兜底重采阈值小时数 (默认 336，即 14 天；P0/P1/P2 按业务分层动态计算)")
+    auto.add_argument("--stale-hours", type=int, default=1440, help="未分层/非 P0-P2 ASIN 的兜底重采阈值小时数 (默认 1440，即 60 天；P0/P1/P2 按业务分层动态计算)")
     auto.add_argument("--batch-size", type=int, default=50, help="每批最大采集 ASIN 数 (默认 50, 实际按 token 余量动态调整)")
     auto.add_argument("--enable-trends", action="store_true", default=True, help="采集 Google Trends (默认开启)")
     auto.add_argument("--disable-trends", action="store_true", help="关闭 Google Trends 采集")

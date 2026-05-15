@@ -173,7 +173,7 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
     def test_auto_discovery_keeps_interactive_reserve(self) -> None:
         allocator = KeepaTokenAllocator(
             KeepaTokenBudget(
-                interactive_min_tokens=90,
+                interactive_min_tokens=150,
                 bestseller_min_tokens=50,
                 safe_reserve_tokens=20,
             )
@@ -181,7 +181,7 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
 
         decision = allocator.can_run(
             queue_name="auto_discovery",
-            tokens_left=120,
+            tokens_left=180,
             cost=50,
             interactive_pending=True,
         )
@@ -193,7 +193,7 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
     def test_auto_discovery_runs_when_above_reserve(self) -> None:
         allocator = KeepaTokenAllocator(
             KeepaTokenBudget(
-                interactive_min_tokens=90,
+                interactive_min_tokens=150,
                 bestseller_min_tokens=50,
                 safe_reserve_tokens=20,
             )
@@ -201,7 +201,7 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
 
         decision = allocator.can_run(
             queue_name="auto_discovery",
-            tokens_left=160,
+            tokens_left=220,
             cost=50,
             interactive_pending=True,
         )
@@ -232,6 +232,21 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
 
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.tokens_available_for_queue, 40)
+
+    def test_history_reserves_interactive_tokens_when_pending(self) -> None:
+        allocator = KeepaTokenAllocator(
+            KeepaTokenBudget(
+                interactive_min_tokens=150,
+                safe_reserve_tokens=20,
+                max_history_tokens_per_run=200,
+                pause_history_when_interactive_pending=False,
+            )
+        )
+
+        decision = allocator.history_token_budget(tokens_left=220, interactive_pending=True)
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.tokens_available_for_queue, 70)
 
 
 if __name__ == "__main__":

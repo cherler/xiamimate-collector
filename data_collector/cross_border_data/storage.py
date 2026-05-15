@@ -58,9 +58,9 @@ _DOMAIN_PRICE_BANDS = {
 }
 
 _BUSINESS_TIER_REFRESH_WINDOWS_DAYS = {
-    "P0": (3, 7),
-    "P1": (10, 14),
-    "P2": (21, 30),
+    "P0": (21, 30),
+    "P1": (45, 60),
+    "P2": (75, 90),
 }
 
 _BUSINESS_TIER_PRIORITY_WINDOWS = {
@@ -569,17 +569,17 @@ class DuckDBStorage:
         *,
         domain: int = 1,
         max_count: int = 100,
-        stale_hours: int = 336,
+        stale_hours: int = 1440,
     ) -> list[dict]:
         """获取需要更新的 ASIN 列表.
 
         优先级:
         1. 从未采集过的 ASIN (last_fetched_at IS NULL)
         2. 已分层 ASIN 按 business_tier 动态重采窗口判定是否过期
-           - P0: 3-7 天
-           - P1: 10-14 天
-           - P2: 21-30 天
-           - 其他分层 / 未分层: 使用 stale_hours 兜底
+           - P0: 21-30 天
+           - P1: 45-60 天
+           - P2: 75-90 天
+           - Anchor / Drop / 其他分层 / 未分层: 使用 stale_hours 兜底，生产默认 60 天
         3. 按 business_priority / priority DESC, first_seen_at ASC 排序
 
         Returns
@@ -615,7 +615,7 @@ class DuckDBStorage:
         self,
         *,
         domain: int = 1,
-        stale_hours: int = 336,
+        stale_hours: int = 1440,
     ) -> int:
         """Return the exact number of active ASINs that need history hydration."""
         stale_hours_sql = _build_dynamic_stale_hours_sql(int(stale_hours))
@@ -635,7 +635,7 @@ class DuckDBStorage:
         asins: list[str],
         *,
         domain: int = 1,
-        stale_hours: int = 336,
+        stale_hours: int = 1440,
     ) -> list[str]:
         """Return input ASINs that still need history hydration, preserving input order."""
         ordered_asins = list(dict.fromkeys([asin for asin in asins if asin]))
