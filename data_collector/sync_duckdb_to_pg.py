@@ -27,7 +27,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -100,18 +99,6 @@ PG_SYNC_AGG_PARTITIONED = os.environ.get("PG_SYNC_AGG_PARTITIONED", "false").low
     "yes",
     "on",
 }
-TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE = os.environ.get(
-    "PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE",
-    "true",
-).lower() not in {"0", "false", "no", "off"}
-THEME_SYNC_TRIGGER_TIMEOUT_SECONDS = max(
-    60,
-    int(os.environ.get("PG_SYNC_TRIGGER_THEME_SYNC_TIMEOUT_SECONDS", "900")),
-)
-THEME_SYNC_TRIGGER_SCRIPT = _resolve_configured_path(
-    "PG_SYNC_TRIGGER_THEME_SYNC_SCRIPT",
-    PROJECT_ROOT / "scripts" / "run_candidate_expansion_refresh_once.sh",
-)
 _SYNC_COPY_DIRS: list[Path] = []
 
 HISTORY_DOMAIN_DAILY_SQL_TEMPLATE = """
@@ -872,7 +859,7 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> list[str]:
                 LEFT JOIN sync.keepa_product_history h
                   ON h.domain = j.domain
                  AND h.asin = r.asin
-                WHERE j.status IN ('syncing', 'completed')
+                WHERE j.status = 'syncing'
                 GROUP BY j.job_id, j.result_candidate_asins
             ),
             incomplete_hydration_jobs AS (
@@ -968,59 +955,6 @@ def _reconcile_candidate_expansion_jobs_completion(pg_conn) -> list[str]:
     return completed_job_ids
 
 
-def _trigger_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) -> bool:
-    """Run theme feature sync after expansion jobs become completed."""
-    completed_count = len(completed_job_ids)
-    if completed_count <= 0:
-        return False
-    if not TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE:
-        logger.info(
-            "  expansion jobs: theme feature sync trigger disabled after %s completed jobs",
-            completed_count,
-        )
-        return False
-    if not THEME_SYNC_TRIGGER_SCRIPT.exists():
-        logger.warning("  theme feature sync trigger script not found: %s", THEME_SYNC_TRIGGER_SCRIPT)
-        return False
-
-    logger.info(
-        "  expansion jobs: triggering theme feature sync after %s completed jobs",
-        completed_count,
-    )
-    configured_lock_mode = os.environ.get("PG_SYNC_TRIGGER_THEME_SYNC_DUCKDB_LOCK_MODE", "").strip().lower()
-    if configured_lock_mode:
-        duckdb_lock_mode = configured_lock_mode
-    else:
-        duckdb_lock_mode = "acquire"
-    try:
-        subprocess.run(
-            ["/bin/bash", str(THEME_SYNC_TRIGGER_SCRIPT)],
-            cwd=str(PROJECT_ROOT),
-            check=True,
-            timeout=THEME_SYNC_TRIGGER_TIMEOUT_SECONDS,
-            env={
-                **os.environ,
-                "PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE": "false",
-                "CANDIDATE_EXPANSION_JOB_IDS": ",".join(completed_job_ids),
-                "CANDIDATE_EXPANSION_DUCKDB_SOURCE": "live",
-                "CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE": duckdb_lock_mode,
-                "CANDIDATE_EXPANSION_REFRESH_SNAPSHOT": "false",
-            },
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "  theme feature sync trigger timed out after %ss",
-            THEME_SYNC_TRIGGER_TIMEOUT_SECONDS,
-        )
-        return False
-    except subprocess.CalledProcessError as exc:
-        logger.warning("  theme feature sync trigger failed: exit_code=%s", exc.returncode)
-        return False
-
-    logger.info("  expansion jobs: theme feature sync trigger completed")
-    return True
-
-
 def _defer_theme_sync_after_expansion_reconcile(completed_job_ids: list[str]) -> bool:
     """Write completed expansion job ids for the shell wrapper to trigger after lock release."""
     output_path_raw = os.environ.get("PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE", "").strip()
@@ -1099,9 +1033,13 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
     if _defer_theme_sync_after_expansion_reconcile(reconciled_expansion_job_ids):
         results["serving.theme_feature_sync:triggered"] = 0
     else:
-        results["serving.theme_feature_sync:triggered"] = int(
-            _trigger_theme_sync_after_expansion_reconcile(reconciled_expansion_job_ids)
-        )
+        if reconciled_expansion_job_ids:
+            logger.warning(
+                "  expansion jobs: %s completed but PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE is unset; "
+                "scoped serving refresh skipped. Run sync_duckdb_to_pg.py via scripts/run_pg_sync_once.sh.",
+                len(reconciled_expansion_job_ids),
+            )
+        results["serving.theme_feature_sync:triggered"] = 0
 
     elapsed = round(time.time() - start, 1)
     total = sum(v for v in results.values() if v > 0)

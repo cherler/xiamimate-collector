@@ -14,6 +14,8 @@ SNAPSHOT_DB_PATH="$SNAPSHOT_CURRENT_LINK/local_analytics.duckdb"
 DATA_MOUNT="${XIAMIMATE_COLLECTOR_HEALTHCHECK_DATA_MOUNT:-/data}"
 DISK_WARN_PCT="${XIAMIMATE_COLLECTOR_HEALTHCHECK_DISK_WARN_PCT:-85}"
 DISK_ERROR_PCT="${XIAMIMATE_COLLECTOR_HEALTHCHECK_DISK_ERROR_PCT:-95}"
+EXPANSION_SUBSET_DIR="${CANDIDATE_EXPANSION_DUCKDB_SUBSET_DIR:-$LOG_DIR/candidate_expansion_duckdb_subsets}"
+EXPANSION_SUBSET_TTL_MINUTES="${CANDIDATE_EXPANSION_DUCKDB_SUBSET_TTL_MINUTES:-360}"
 
 ERRORS=0
 WARNINGS=0
@@ -169,6 +171,28 @@ check_log_file "$LOG_DIR/auto_collect.service.log"
 check_log_file "$LOG_DIR/pg_sync.timer.log"
 check_timer_log_file xiamimate-theme-sync-snapshot.timer "$LOG_DIR/theme_sync.timer.log"
 check_timer_log_file xiamimate-pg-agg-sync-snapshot.timer "$LOG_DIR/pg_agg_sync.timer.log"
+
+prune_candidate_expansion_subsets() {
+    if [[ ! -d "$EXPANSION_SUBSET_DIR" ]]; then
+        return
+    fi
+    if [[ ! "$EXPANSION_SUBSET_TTL_MINUTES" =~ ^[0-9]+$ ]] || (( EXPANSION_SUBSET_TTL_MINUTES <= 0 )); then
+        return
+    fi
+    # Subset DuckDBs are normally cleaned by run_candidate_expansion_refresh_once.sh's EXIT trap.
+    # Anything still present beyond the TTL is leftover from a crashed build and safe to remove.
+    local pruned
+    pruned="$(find "$EXPANSION_SUBSET_DIR" -maxdepth 1 -type f \
+        \( -name '*.duckdb' -o -name '*.duckdb.wal' -o -name '*.manifest.json' \) \
+        -mmin +"$EXPANSION_SUBSET_TTL_MINUTES" -print -delete 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ -n "$pruned" && "$pruned" != "0" ]]; then
+        warn "pruned $pruned stale candidate-expansion subset files older than ${EXPANSION_SUBSET_TTL_MINUTES}min from $EXPANSION_SUBSET_DIR"
+    else
+        ok "candidate expansion subset dir clean: $EXPANSION_SUBSET_DIR (ttl=${EXPANSION_SUBSET_TTL_MINUTES}min)"
+    fi
+}
+
+prune_candidate_expansion_subsets
 
 echo "=== summary: errors=$ERRORS warnings=$WARNINGS ==="
 

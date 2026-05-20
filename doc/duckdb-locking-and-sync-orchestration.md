@@ -54,7 +54,8 @@
 - 任何直接访问 live DuckDB 的流程必须持有这把锁。
 - 已持有这把锁的父流程不能再同步调用一个会重新 `flock -x` 同一文件的子流程，否则会造成父子自锁。
 - 如果确实需要在同一个 live DuckDB critical section 内调用子脚本，子脚本只能使用 `CANDIDATE_EXPANSION_DUCKDB_LOCK_MODE=inherit`，并且只能由确定已持锁的父流程设置。
-- 当前默认修复策略不是继承整段 serving sync，而是 PG sync 先把 completed job ids 写入临时文件，退出 Python 进程并释放 live DuckDB 锁，再由外层 shell 触发 scoped refresh。这样 scoped refresh 会重新申请同一把 live DuckDB 锁，仅在构建 subset 时持有，之后 scoped PG/theme sync 读 subset，不再占用 live 锁。
+- 当前唯一受支持的补池→serving 触发链路是 deferred：PG sync Python 把 completed job ids 写入临时文件后退出，释放 live DuckDB 锁与 `sync_duckdb_to_pg.lock`，再由 `run_pg_sync_once.sh` 调用 `run_candidate_expansion_refresh_once.sh`。inline 触发路径已下线，避免任何父子自锁回退。
+- 锁文件以 append 模式（`exec 8>>"$LOCK_FILE"`）打开后再 `flock -x -w`，等待时不会清空当前持有者写入的 `pid/role/acquired_at`，`cat duckdb_live_access.lock` 在排障时一直可用。
 
 ### `sync_duckdb_to_pg.lock`
 
@@ -121,6 +122,11 @@
 7. scoped PG sync 从 subset 同步必要表，且禁用二次 theme trigger。
 8. scoped theme-sync 从 subset 写 `serving.theme_base_daily`、`serving.theme_trends_daily`、`serving.theme_cross_daily`。
 9. theme-api 再查 job readiness 时，`serving_base_hit_count >= ready_threshold`，`analysis_ready=true`。
+
+注意:
+
+- reconcile pass 1 只把 `status='syncing'` 的 job 推进到 `completed`，不会把已经 `completed` 的 job 误回退到 `hydrating`。
+- subset DuckDB 文件由 `run_candidate_expansion_refresh_once.sh` 的 EXIT trap 清理。万一 wrapper 崩溃留下垃圾文件，`check_ecs2_collector_health.sh` 每 5 分钟会删除 `CANDIDATE_EXPANSION_DUCKDB_SUBSET_DIR` 下超过 `CANDIDATE_EXPANSION_DUCKDB_SUBSET_TTL_MINUTES`（默认 360 分钟）的 `*.duckdb*` / `*.manifest.json`。
 
 ## 排查命令
 

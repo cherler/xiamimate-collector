@@ -79,7 +79,8 @@ acquire_duckdb_access_lock() {
 
     mkdir -p "$(dirname "$DUCKDB_ACCESS_LOCK_FILE")"
     echo "pg-sync waiting for DuckDB access lock: $DUCKDB_ACCESS_LOCK_FILE timeout=${DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS}s"
-    exec 8>"$DUCKDB_ACCESS_LOCK_FILE"
+    # Open append-mode so that the current holder's metadata stays readable while we wait.
+    exec 8>>"$DUCKDB_ACCESS_LOCK_FILE"
     if ! flock -x -w "$DUCKDB_ACCESS_LOCK_TIMEOUT_SECONDS" 8; then
         echo "timed out waiting for DuckDB access lock: $DUCKDB_ACCESS_LOCK_FILE" >&2
         exit 1
@@ -160,12 +161,11 @@ if collector_pg_tunnel_enabled; then
     export PG_PORT="$PG_SYNC_TUNNEL_LOCAL_PORT_VALUE"
 fi
 
-if env_flag_enabled "${PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE:-true}" && env_flag_enabled "${PG_SYNC_DEFER_THEME_SYNC_TRIGGER:-true}"; then
+if [[ -z "${PG_SYNC_DUCKDB_PATH:-}" ]] && env_flag_enabled "${PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE:-true}"; then
     DEFER_THEME_SYNC_TRIGGER="true"
     RECONCILED_EXPANSION_JOB_IDS_FILE="$LOG_DIR/reconciled_expansion_job_ids.$$"
     : >"$RECONCILED_EXPANSION_JOB_IDS_FILE"
     export PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE="$RECONCILED_EXPANSION_JOB_IDS_FILE"
-    export PG_SYNC_TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE=false
 fi
 
 cmd=(

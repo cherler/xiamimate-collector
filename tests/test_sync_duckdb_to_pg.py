@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-from pathlib import Path
+import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from data_collector.sync_duckdb_to_pg import (
+    _defer_theme_sync_after_expansion_reconcile,
     _reconcile_candidate_expansion_jobs_completion,
-    _trigger_theme_sync_after_expansion_reconcile,
 )
 
 
 class FakeCursor:
-    def __init__(self, rows: list[tuple[str]]) -> None:
-        self.rows = rows
+    def __init__(self, rows_per_execute: list[list[tuple[str]]]) -> None:
+        self._rows_per_execute = list(rows_per_execute)
+        self._last_rows: list[tuple[str]] = []
         self.executed_sql = ""
 
     def __enter__(self) -> "FakeCursor":
@@ -24,14 +26,15 @@ class FakeCursor:
 
     def execute(self, sql: str) -> None:
         self.executed_sql += sql
+        self._last_rows = self._rows_per_execute.pop(0) if self._rows_per_execute else []
 
     def fetchall(self) -> list[tuple[str]]:
-        return self.rows
+        return self._last_rows
 
 
 class FakeConnection:
-    def __init__(self, rows: list[tuple[str]]) -> None:
-        self.cursor_obj = FakeCursor(rows)
+    def __init__(self, rows_per_execute: list[list[tuple[str]]]) -> None:
+        self.cursor_obj = FakeCursor(rows_per_execute)
         self.commit_count = 0
 
     def cursor(self) -> FakeCursor:
@@ -42,43 +45,42 @@ class FakeConnection:
 
 
 class SyncExpansionJobsTests(unittest.TestCase):
-    def test_reconcile_marks_syncing_jobs_when_all_result_asins_are_in_pg(self) -> None:
-        conn = FakeConnection(rows=[("kexp_1",), ("kexp_2",)])
+    def test_reconcile_returns_completed_job_ids(self) -> None:
+        conn = FakeConnection(rows_per_execute=[[], [("kexp_1",), ("kexp_2",)]])
 
-        completed_count = _reconcile_candidate_expansion_jobs_completion(conn)
+        completed_job_ids = _reconcile_candidate_expansion_jobs_completion(conn)
 
-        self.assertEqual(completed_count, 2)
+        self.assertEqual(completed_job_ids, ["kexp_1", "kexp_2"])
         self.assertEqual(conn.commit_count, 1)
         self.assertIn("sync.keepa_candidate_expansion_jobs", conn.cursor_obj.executed_sql)
         self.assertIn("sync.keepa_asin_registry", conn.cursor_obj.executed_sql)
-        self.assertIn("j.status IN ('syncing', 'completed')", conn.cursor_obj.executed_sql)
         self.assertIn("status = 'hydrating'", conn.cursor_obj.executed_sql)
         self.assertIn("last_fetched_at IS NOT NULL", conn.cursor_obj.executed_sql)
-        self.assertIn("j.status = 'syncing'", conn.cursor_obj.executed_sql)
-        self.assertIn("synced_asin_count >= expected_asin_count", conn.cursor_obj.executed_sql)
-        self.assertIn("fetched_asin_count >= expected_asin_count", conn.cursor_obj.executed_sql)
         self.assertIn("status = 'completed'", conn.cursor_obj.executed_sql)
+        # Pass 1 must only requeue jobs currently in 'syncing' to avoid reverting
+        # already-completed jobs back to hydrating.
+        self.assertNotIn("j.status IN ('syncing', 'completed')", conn.cursor_obj.executed_sql)
 
-    def test_theme_sync_trigger_runs_when_expansion_jobs_are_completed(self) -> None:
+    def test_defer_writes_completed_job_ids_to_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            script_path = Path(tmpdir) / "run_theme_feature_sync_once.sh"
-            script_path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            output_path = Path(tmpdir) / "reconciled_expansion_job_ids.txt"
+            with patch.dict(
+                os.environ,
+                {"PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE": str(output_path)},
+                clear=False,
+            ):
+                deferred = _defer_theme_sync_after_expansion_reconcile(["kexp_1", "kexp_2"])
 
-            with patch("data_collector.sync_duckdb_to_pg.THEME_SYNC_TRIGGER_SCRIPT", script_path), \
-                 patch("data_collector.sync_duckdb_to_pg.TRIGGER_THEME_SYNC_ON_EXPANSION_RECONCILE", True), \
-                 patch("data_collector.sync_duckdb_to_pg.subprocess.run") as run_mock:
-                triggered = _trigger_theme_sync_after_expansion_reconcile(2)
+            self.assertTrue(deferred)
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8").splitlines(),
+                ["kexp_1", "kexp_2"],
+            )
 
-        self.assertTrue(triggered)
-        run_mock.assert_called_once()
-        self.assertEqual(run_mock.call_args.args[0], ["/bin/bash", str(script_path)])
-
-    def test_theme_sync_trigger_skips_when_no_expansion_jobs_completed(self) -> None:
-        with patch("data_collector.sync_duckdb_to_pg.subprocess.run") as run_mock:
-            triggered = _trigger_theme_sync_after_expansion_reconcile(0)
-
-        self.assertFalse(triggered)
-        run_mock.assert_not_called()
+    def test_defer_no_op_when_env_file_unset(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(_defer_theme_sync_after_expansion_reconcile(["kexp_1"]))
 
 
 if __name__ == "__main__":

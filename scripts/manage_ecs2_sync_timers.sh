@@ -16,7 +16,6 @@ fi
 
 PG_INTERVAL="${XIAMIMATE_PG_SYNC_TIMER_INTERVAL:-5min}"
 THEME_CALENDAR="${XIAMIMATE_THEME_SYNC_TIMER_CALENDAR:-*-*-* 01:00:00}"
-PG_HISTORY_CALENDAR="${XIAMIMATE_PG_HISTORY_SYNC_TIMER_CALENDAR:-*-*-* 00/6:00:00}"
 PG_AGG_CALENDAR="${XIAMIMATE_PG_AGG_SYNC_TIMER_CALENDAR:-Sun *-*-* 04:00:00}"
 
 systemd_available() {
@@ -30,9 +29,6 @@ service_name_for() {
             ;;
         theme-sync)
             echo "xiamimate-theme-sync-snapshot.service"
-            ;;
-        pg-history-sync)
-            echo "xiamimate-pg-history-sync-snapshot.service"
             ;;
         pg-agg-sync)
             echo "xiamimate-pg-agg-sync-snapshot.service"
@@ -51,9 +47,6 @@ timer_name_for() {
             ;;
         theme-sync)
             echo "xiamimate-theme-sync-snapshot.timer"
-            ;;
-        pg-history-sync)
-            echo "xiamimate-pg-history-sync-snapshot.timer"
             ;;
         pg-agg-sync)
             echo "xiamimate-pg-agg-sync-snapshot.timer"
@@ -81,9 +74,6 @@ description_for() {
         theme-sync)
             echo "XiaMimate Theme Snapshot Sync"
             ;;
-        pg-history-sync)
-            echo "XiaMimate PostgreSQL History Snapshot Sync"
-            ;;
         pg-agg-sync)
             echo "XiaMimate PostgreSQL Aggregate Snapshot Sync"
             ;;
@@ -98,9 +88,6 @@ exec_start_for() {
         theme-sync)
             echo "/bin/bash $ROOT_DIR/scripts/run_theme_feature_sync_once.sh"
             ;;
-        pg-history-sync)
-            echo "/bin/bash $ROOT_DIR/scripts/run_pg_sync_history_once.sh"
-            ;;
         pg-agg-sync)
             echo "/bin/bash $ROOT_DIR/scripts/run_pg_sync_agg_once.sh"
             ;;
@@ -114,9 +101,6 @@ log_file_for() {
             ;;
         theme-sync)
             echo "$DEFAULT_LOG_DIR/theme_sync.timer.log"
-            ;;
-        pg-history-sync)
-            echo "$DEFAULT_LOG_DIR/pg_history_sync.timer.log"
             ;;
         pg-agg-sync)
             echo "$DEFAULT_LOG_DIR/pg_agg_sync.timer.log"
@@ -189,21 +173,6 @@ Unit=$(service_name_for "$job")
 WantedBy=timers.target
 EOF_TIMER
             ;;
-        pg-history-sync)
-            cat > "$timer_path" <<EOF_TIMER
-[Unit]
-Description=$(description_for "$job") Timer
-
-[Timer]
-OnCalendar=$PG_HISTORY_CALENDAR
-AccuracySec=1min
-Persistent=true
-Unit=$(service_name_for "$job")
-
-[Install]
-WantedBy=timers.target
-EOF_TIMER
-            ;;
         pg-agg-sync)
             cat > "$timer_path" <<EOF_TIMER
 [Unit]
@@ -252,7 +221,16 @@ install_job() {
 }
 
 decommission_removed_jobs() {
-    uninstall_job pg-history-sync
+    # pg-history-sync 已并入 pg-sync。在仍有残留 unit 的主机上把 legacy timer 清掉，
+    # 然后通过 case 表移除该 job 名后，这里直接按 unit 名操作。
+    local legacy_units=(
+        "xiamimate-pg-history-sync-snapshot.timer"
+        "xiamimate-pg-history-sync-snapshot.service"
+    )
+    for unit in "${legacy_units[@]}"; do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        rm -f "$SYSTEMD_DIR/$unit"
+    done
 }
 
 uninstall_job() {
@@ -308,7 +286,7 @@ run_for_jobs() {
                 jobs=(pg-sync theme-sync pg-agg-sync)
                 ;;
             uninstall)
-                jobs=(pg-sync theme-sync pg-history-sync pg-agg-sync)
+                jobs=(pg-sync theme-sync pg-agg-sync)
                 ;;
         esac
     else
@@ -351,11 +329,11 @@ run_for_jobs() {
 usage() {
     cat <<EOF_USAGE
 Usage:
-    bash scripts/manage_ecs2_sync_timers.sh install [all|pg-sync|theme-sync|pg-history-sync|pg-agg-sync]
-    bash scripts/manage_ecs2_sync_timers.sh uninstall [all|pg-sync|theme-sync|pg-history-sync|pg-agg-sync]
-    bash scripts/manage_ecs2_sync_timers.sh status [all|pg-sync|theme-sync|pg-history-sync|pg-agg-sync]
-    bash scripts/manage_ecs2_sync_timers.sh run-once [pg-sync|theme-sync|pg-history-sync|pg-agg-sync]
-    bash scripts/manage_ecs2_sync_timers.sh logs [pg-sync|theme-sync|pg-history-sync|pg-agg-sync]
+    bash scripts/manage_ecs2_sync_timers.sh install [all|pg-sync|theme-sync|pg-agg-sync]
+    bash scripts/manage_ecs2_sync_timers.sh uninstall [all|pg-sync|theme-sync|pg-agg-sync]
+    bash scripts/manage_ecs2_sync_timers.sh status [all|pg-sync|theme-sync|pg-agg-sync]
+    bash scripts/manage_ecs2_sync_timers.sh run-once [pg-sync|theme-sync|pg-agg-sync]
+    bash scripts/manage_ecs2_sync_timers.sh logs [pg-sync|theme-sync|pg-agg-sync]
 
 Environment:
   XIAMIMATE_COLLECTOR_ENV_FILE         default: $ROOT_DIR/data_collector/.env
@@ -363,7 +341,7 @@ Environment:
     XIAMIMATE_PG_SYNC_TIMER_INTERVAL     default: 5min
     XIAMIMATE_THEME_SYNC_TIMER_CALENDAR  default: *-*-* 01:00:00
     XIAMIMATE_PG_AGG_SYNC_TIMER_CALENDAR default: Sun *-*-* 04:00:00
-    pg-history-sync is legacy; install all disables its timer because history is included in pg-sync.
+    legacy pg-history-sync timer is auto-removed by 'install all' (history is merged into pg-sync).
 EOF_USAGE
 }
 

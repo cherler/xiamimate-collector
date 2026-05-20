@@ -69,7 +69,7 @@ case "$CANDIDATE_EXPANSION_DUCKDB_SOURCE" in
                     build_live_subset_duckdb
                     : >"$DUCKDB_ACCESS_LOCK_FILE"
                     flock -u 8
-                } 8>"$DUCKDB_ACCESS_LOCK_FILE"
+                } 8>>"$DUCKDB_ACCESS_LOCK_FILE"
                 ;;
             inherit)
                 echo "candidate expansion refresh: using caller-held DuckDB access lock: $DUCKDB_ACCESS_LOCK_FILE"

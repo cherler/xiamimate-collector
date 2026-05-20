@@ -58,7 +58,8 @@ flock -x 9
 
 if [[ -n "$SNAPSHOT_ACCESS_LOCK_FILE" ]]; then
     mkdir -p "$(dirname "$SNAPSHOT_ACCESS_LOCK_FILE")"
-    exec 8>"$SNAPSHOT_ACCESS_LOCK_FILE"
+    # Open append-mode so that the current holder's metadata stays readable while we wait.
+    exec 8>>"$SNAPSHOT_ACCESS_LOCK_FILE"
     if ! flock -x -w "$SNAPSHOT_ACCESS_LOCK_TIMEOUT_SECONDS" 8; then
         echo "timed out waiting for DuckDB access lock: $SNAPSHOT_ACCESS_LOCK_FILE" >&2
         exit 1
