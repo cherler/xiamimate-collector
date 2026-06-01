@@ -104,6 +104,14 @@ PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS = max(
     1,
     int(os.environ.get("PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS", str(max(PG_SYNC_AGG_LOOKBACK_DAYS, 14)))),
 )
+PG_SYNC_AGG_INCREMENTAL_DATE_DAYS = max(
+    1,
+    int(os.environ.get("PG_SYNC_AGG_INCREMENTAL_DATE_DAYS", "120")),
+)
+PG_SYNC_AGG_MAX_AFFECTED_BUCKETS = max(
+    1,
+    int(os.environ.get("PG_SYNC_AGG_MAX_AFFECTED_BUCKETS", "120")),
+)
 PG_SYNC_AGG_PARTITIONED = os.environ.get("PG_SYNC_AGG_PARTITIONED", "false").lower() in {
     "1",
     "true",
@@ -849,18 +857,29 @@ def _find_affected_agg_days(
     duck: duckdb.DuckDBPyConnection,
     *,
     cutoff_ts: str,
+    date_window_days: int = PG_SYNC_AGG_INCREMENTAL_DATE_DAYS,
+    max_buckets: int = PG_SYNC_AGG_MAX_AFFECTED_BUCKETS,
 ) -> list[tuple[int, date]]:
+    effective_date_window_days = min(int(date_window_days), PG_SYNC_AGG_HISTORY_DAYS)
     query = f"""
 SELECT
     domain,
     date
 FROM curated.keepa_product_history
-WHERE date >= CURRENT_DATE - INTERVAL '{PG_SYNC_AGG_HISTORY_DAYS} days'
+WHERE date >= CURRENT_DATE - INTERVAL '{effective_date_window_days} days'
   AND ingested_at >= TIMESTAMP '{cutoff_ts}'
 GROUP BY 1, 2
-ORDER BY 1, 2
+LIMIT {int(max_buckets) + 1}
 """
-    return [(int(domain), day) for domain, day in duck.execute(query).fetchall()]
+    rows = [(int(domain), day) for domain, day in duck.execute(query).fetchall()]
+    if len(rows) > max_buckets:
+        raise RuntimeError(
+            "incremental agg affected bucket count exceeded "
+            f"PG_SYNC_AGG_MAX_AFFECTED_BUCKETS={max_buckets}; "
+            f"cutoff={cutoff_ts}, date_window_days={effective_date_window_days}. "
+            "Run a controlled full/partitioned repair window or lower PG_SYNC_AGG_LOOKBACK_DAYS."
+        )
+    return sorted(rows)
 
 
 def _sync_incremental_agg_refresh(
@@ -890,6 +909,15 @@ def _sync_incremental_agg_refresh(
             _elapsed_seconds(retention_started_at),
         )
 
+    logger.info(
+        "  %s → %s: affected domain/date query start (cutoff=%s, %s, date_window_days=%s, max_buckets=%s)",
+        duck_table,
+        pg_table,
+        cutoff_ts,
+        cutoff_reason,
+        min(PG_SYNC_AGG_INCREMENTAL_DATE_DAYS, PG_SYNC_AGG_HISTORY_DAYS),
+        PG_SYNC_AGG_MAX_AFFECTED_BUCKETS,
+    )
     affected_days = _find_affected_agg_days(duck, cutoff_ts=cutoff_ts)
     if not affected_days:
         logger.info(

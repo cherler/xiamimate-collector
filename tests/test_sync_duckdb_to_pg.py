@@ -89,7 +89,7 @@ class SyncExpansionJobsTests(unittest.TestCase):
 
 
 class AggIncrementalTests(unittest.TestCase):
-    def test_find_affected_agg_days_uses_ingested_at_and_history_window(self) -> None:
+    def test_find_affected_agg_days_uses_ingested_at_and_incremental_date_window(self) -> None:
         conn = duckdb.connect(":memory:")
         self.addCleanup(conn.close)
         conn.execute("CREATE SCHEMA curated")
@@ -104,6 +104,7 @@ class AggIncrementalTests(unittest.TestCase):
         )
         today = date.today()
         yesterday = today - timedelta(days=1)
+        outside_incremental_window_day = today - timedelta(days=150)
         old_day = today - timedelta(days=1200)
         now_ts = datetime.now()
         stale_ts = now_ts - timedelta(days=30)
@@ -112,6 +113,7 @@ class AggIncrementalTests(unittest.TestCase):
             [
                 (1, today, now_ts),
                 (1, yesterday, stale_ts),
+                (1, outside_incremental_window_day, now_ts),
                 (2, old_day, now_ts),
             ],
         )
@@ -122,6 +124,37 @@ class AggIncrementalTests(unittest.TestCase):
         )
 
         self.assertEqual(affected_days, [(1, today)])
+
+    def test_find_affected_agg_days_raises_when_bucket_limit_exceeded(self) -> None:
+        conn = duckdb.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE SCHEMA curated")
+        conn.execute(
+            """
+            CREATE TABLE curated.keepa_product_history (
+                domain INTEGER,
+                date DATE,
+                ingested_at TIMESTAMP
+            )
+            """
+        )
+        today = date.today()
+        now_ts = datetime.now()
+        conn.executemany(
+            "INSERT INTO curated.keepa_product_history VALUES (?, ?, ?)",
+            [
+                (1, today, now_ts),
+                (1, today - timedelta(days=1), now_ts),
+                (1, today - timedelta(days=2), now_ts),
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "PG_SYNC_AGG_MAX_AFFECTED_BUCKETS"):
+            _find_affected_agg_days(
+                conn,
+                cutoff_ts=(now_ts - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                max_buckets=2,
+            )
 
     def test_build_partitioned_agg_select_scopes_single_day(self) -> None:
         query = _build_partitioned_agg_select(
