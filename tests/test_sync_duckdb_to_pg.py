@@ -3,11 +3,16 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import duckdb
+
 from data_collector.sync_duckdb_to_pg import (
+    _build_partitioned_agg_select,
     _defer_theme_sync_after_expansion_reconcile,
+    _find_affected_agg_days,
     _reconcile_candidate_expansion_jobs_completion,
 )
 
@@ -81,6 +86,56 @@ class SyncExpansionJobsTests(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "PG_SYNC_RECONCILED_EXPANSION_JOB_IDS_FILE"}
         with patch.dict(os.environ, env, clear=True):
             self.assertFalse(_defer_theme_sync_after_expansion_reconcile(["kexp_1"]))
+
+
+class AggIncrementalTests(unittest.TestCase):
+    def test_find_affected_agg_days_uses_ingested_at_and_history_window(self) -> None:
+        conn = duckdb.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE SCHEMA curated")
+        conn.execute(
+            """
+            CREATE TABLE curated.keepa_product_history (
+                domain INTEGER,
+                date DATE,
+                ingested_at TIMESTAMP
+            )
+            """
+        )
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        old_day = today - timedelta(days=1200)
+        now_ts = datetime.now()
+        stale_ts = now_ts - timedelta(days=30)
+        conn.executemany(
+            "INSERT INTO curated.keepa_product_history VALUES (?, ?, ?)",
+            [
+                (1, today, now_ts),
+                (1, yesterday, stale_ts),
+                (2, old_day, now_ts),
+            ],
+        )
+
+        affected_days = _find_affected_agg_days(
+            conn,
+            cutoff_ts=(now_ts - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        self.assertEqual(affected_days, [(1, today)])
+
+    def test_build_partitioned_agg_select_scopes_single_day(self) -> None:
+        query = _build_partitioned_agg_select(
+            {
+                "duck_sql_template": "SELECT h.date, h.domain FROM curated.keepa_product_history h {where_clause}"
+            },
+            domain=1,
+            start_date=date(2026, 5, 1),
+            end_date=date(2026, 5, 2),
+        )
+
+        self.assertIn("h.domain = 1", query)
+        self.assertIn("h.date >= DATE '2026-05-01'", query)
+        self.assertIn("h.date < DATE '2026-05-02'", query)
 
 
 if __name__ == "__main__":

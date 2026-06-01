@@ -97,18 +97,31 @@ PG_SYNC_PROGRESS_LOG_FETCH_BATCHES = max(
 PG_AGG_REFRESH_INTERVAL_SECONDS = max(
     300, int(os.environ.get("PG_AGG_REFRESH_INTERVAL_SECONDS", "3600"))
 )
+PG_SYNC_AGG_MODE = os.environ.get("PG_SYNC_AGG_MODE", "incremental").strip().lower()
 PG_SYNC_AGG_HISTORY_DAYS = max(30, int(os.environ.get("PG_SYNC_AGG_HISTORY_DAYS", "1095")))
+PG_SYNC_AGG_LOOKBACK_DAYS = max(0, int(os.environ.get("PG_SYNC_AGG_LOOKBACK_DAYS", "14")))
+PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS = max(
+    1,
+    int(os.environ.get("PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS", str(max(PG_SYNC_AGG_LOOKBACK_DAYS, 14)))),
+)
 PG_SYNC_AGG_PARTITIONED = os.environ.get("PG_SYNC_AGG_PARTITIONED", "false").lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
+PG_SYNC_AGG_FULL_REFRESH = PG_SYNC_AGG_MODE in {"full", "window", "full_refresh", "partitioned"}
 _SYNC_COPY_DIRS: list[Path] = []
 
 
 def _elapsed_seconds(started_at: float) -> float:
     return round(time.time() - started_at, 1)
+
+
+def _utc_dt_to_duck_ts(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return _pg_ts_to_duck_ts(value.astimezone(timezone.utc))
 
 
 HISTORY_AGG_WHERE_CLAUSE = f"WHERE h.date >= CURRENT_DATE - INTERVAL '{PG_SYNC_AGG_HISTORY_DAYS} days'"
@@ -253,7 +266,8 @@ SYNC_TABLES = {
         "timestamp_col": "aggregated_at",
         "duck_sql": HISTORY_DOMAIN_DAILY_SQL,
         "duck_sql_template": HISTORY_DOMAIN_DAILY_SQL_TEMPLATE,
-        "always_full_refresh": True,
+        "always_full_refresh": PG_SYNC_AGG_FULL_REFRESH,
+        "incremental_agg_refresh": not PG_SYNC_AGG_FULL_REFRESH,
         "full_refresh_partition_values_sql": HISTORY_MONTH_PARTITIONS_SQL if PG_SYNC_AGG_PARTITIONED else None,
         "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
         "retention_days": PG_SYNC_AGG_HISTORY_DAYS,
@@ -265,7 +279,8 @@ SYNC_TABLES = {
         "timestamp_col": "aggregated_at",
         "duck_sql": HISTORY_ROOT_CATEGORY_DAILY_SQL,
         "duck_sql_template": HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE,
-        "always_full_refresh": True,
+        "always_full_refresh": PG_SYNC_AGG_FULL_REFRESH,
+        "incremental_agg_refresh": not PG_SYNC_AGG_FULL_REFRESH,
         "full_refresh_partition_values_sql": HISTORY_MONTH_PARTITIONS_SQL if PG_SYNC_AGG_PARTITIONED else None,
         "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
         "retention_days": PG_SYNC_AGG_HISTORY_DAYS,
@@ -816,18 +831,191 @@ def _sync_partitioned_full_refresh(
     return total_rows
 
 
+def _agg_incremental_cutoff(sync_state: dict, pg_table: str) -> tuple[str, str]:
+    last_synced_at = sync_state.get(pg_table)
+    if last_synced_at:
+        try:
+            last_synced_dt = datetime.fromisoformat(last_synced_at)
+            cutoff_dt = last_synced_dt - timedelta(days=PG_SYNC_AGG_LOOKBACK_DAYS)
+            return _utc_dt_to_duck_ts(cutoff_dt), f"state={last_synced_at} lookback_days={PG_SYNC_AGG_LOOKBACK_DAYS}"
+        except ValueError:
+            logger.warning("  %s: invalid sync state timestamp ignored: %s", pg_table, last_synced_at)
+
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS)
+    return _utc_dt_to_duck_ts(cutoff_dt), f"initial_lookback_days={PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS}"
+
+
+def _find_affected_agg_days(
+    duck: duckdb.DuckDBPyConnection,
+    *,
+    cutoff_ts: str,
+) -> list[tuple[int, date]]:
+    query = f"""
+SELECT
+    domain,
+    date
+FROM curated.keepa_product_history
+WHERE date >= CURRENT_DATE - INTERVAL '{PG_SYNC_AGG_HISTORY_DAYS} days'
+  AND ingested_at >= TIMESTAMP '{cutoff_ts}'
+GROUP BY 1, 2
+ORDER BY 1, 2
+"""
+    return [(int(domain), day) for domain, day in duck.execute(query).fetchall()]
+
+
+def _sync_incremental_agg_refresh(
+    duck: duckdb.DuckDBPyConnection,
+    pg_conn,
+    duck_table: str,
+    config: dict,
+    sync_state: dict,
+) -> int:
+    started_at = time.time()
+    pg_table = config["pg_table"]
+    pk = config["pk"]
+    cutoff_ts, cutoff_reason = _agg_incremental_cutoff(sync_state, pg_table)
+
+    retention_days = config.get("retention_days")
+    retention_column = config.get("retention_column")
+    if retention_days and retention_column:
+        retention_started_at = time.time()
+        _apply_pg_retention(pg_conn, pg_table, retention_column, int(retention_days))
+        pg_conn.commit()
+        logger.info(
+            "  %s → %s: PG retention delete done for %s older than %s days in %ss",
+            duck_table,
+            pg_table,
+            retention_column,
+            retention_days,
+            _elapsed_seconds(retention_started_at),
+        )
+
+    affected_days = _find_affected_agg_days(duck, cutoff_ts=cutoff_ts)
+    if not affected_days:
+        logger.info(
+            "  %s → %s: no affected domain/date for incremental agg (cutoff=%s, %s)",
+            duck_table,
+            pg_table,
+            cutoff_ts,
+            cutoff_reason,
+        )
+        return 0
+
+    logger.info(
+        "  %s → %s: incremental agg start (%s affected domain/date buckets, cutoff=%s, %s)",
+        duck_table,
+        pg_table,
+        len(affected_days),
+        cutoff_ts,
+        cutoff_reason,
+    )
+
+    total_rows = 0
+    failed_days = 0
+    for domain, day in affected_days:
+        day_started_at = time.time()
+        end_date = day + timedelta(days=1)
+        day_label = f"domain={domain} date={day}"
+        try:
+            query = _build_partitioned_agg_select(config, domain, day, end_date)
+            logger.info("  %s → %s [%s]: DuckDB query start", duck_table, pg_table, day_label)
+            result = duck.execute(query)
+            _, keep_idx, columns = _prepare_result_columns(result, config)
+            first_batch = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
+            sql = _build_pg_insert_sql(pg_table, columns, pk)
+            logger.info(
+                "  %s → %s [%s]: first DuckDB batch fetched (%s rows, %ss)",
+                duck_table,
+                pg_table,
+                day_label,
+                len(first_batch),
+                _elapsed_seconds(day_started_at),
+            )
+
+            with pg_conn.cursor() as cur:
+                delete_started_at = time.time()
+                cur.execute(
+                    f"DELETE FROM {pg_table} WHERE domain = %s AND date = %s",
+                    [domain, day],
+                )
+                logger.info(
+                    "  %s → %s [%s]: PG day delete done in %ss",
+                    duck_table,
+                    pg_table,
+                    day_label,
+                    _elapsed_seconds(delete_started_at),
+                )
+                if first_batch:
+                    rows, fetch_batches, dropped_duplicates = _insert_result_batches(
+                        cur,
+                        result,
+                        first_batch,
+                        duck_table=duck_table,
+                        pg_table=pg_table,
+                        columns=columns,
+                        keep_idx=keep_idx,
+                        pk=pk,
+                        sql=sql,
+                    )
+                    total_rows += rows
+                    duplicate_suffix = ""
+                    if dropped_duplicates > 0:
+                        duplicate_suffix = f", dropped {dropped_duplicates} duplicate rows"
+                    logger.info(
+                        "  %s → %s [%s]: %s rows across %s fetch batches%s",
+                        duck_table,
+                        pg_table,
+                        day_label,
+                        rows,
+                        fetch_batches,
+                        duplicate_suffix,
+                    )
+                else:
+                    logger.info("  %s → %s [%s]: 无数据", duck_table, pg_table, day_label)
+            pg_conn.commit()
+            logger.info(
+                "  %s → %s [%s]: day committed in %ss",
+                duck_table,
+                pg_table,
+                day_label,
+                _elapsed_seconds(day_started_at),
+            )
+        except Exception as exc:
+            pg_conn.rollback()
+            failed_days += 1
+            logger.warning("  %s → %s [%s] 失败: %s", duck_table, pg_table, day_label, exc)
+
+    elapsed = _elapsed_seconds(started_at)
+    logger.info(
+        "  %s → %s: incremental agg wrote %s rows in %ss (%s affected days, %s failed)",
+        duck_table,
+        pg_table,
+        total_rows,
+        elapsed,
+        len(affected_days),
+        failed_days,
+    )
+    if failed_days:
+        raise RuntimeError(f"{duck_table} incremental agg failed for {failed_days} affected days")
+    return total_rows
+
+
 def sync_table(
     duck: duckdb.DuckDBPyConnection,
     pg_conn,
     duck_table: str,
     config: dict,
     full: bool = False,
+    sync_state: dict | None = None,
 ) -> int:
     """同步单张表, 返回写入行数."""
     started_at = time.time()
     pg_table = config["pg_table"]
     pk = config["pk"]
     ts_col = config["timestamp_col"]
+    if config.get("incremental_agg_refresh") and not full:
+        return _sync_incremental_agg_refresh(duck, pg_conn, duck_table, config, sync_state or {})
+
     effective_full = full or config.get("always_full_refresh", False)
     if effective_full and config.get("full_refresh_partition_values_sql") and config.get("duck_sql_template"):
         return _sync_partitioned_full_refresh(duck, pg_conn, duck_table, config)
@@ -1172,7 +1360,7 @@ def run_sync(duckdb_path: str | Path, full: bool = False, state_path: str | Path
                     results[duck_table] = 0
                     continue
 
-                count = sync_table(duck, pg_conn, duck_table, config, full=full)
+                count = sync_table(duck, pg_conn, duck_table, config, full=full, sync_state=sync_state)
                 results[duck_table] = count
                 sync_state[config["pg_table"]] = datetime.now(timezone.utc).isoformat()
             except Exception as e:
