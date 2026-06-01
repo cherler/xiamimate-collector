@@ -17,6 +17,8 @@ fi
 PG_INTERVAL="${XIAMIMATE_PG_SYNC_TIMER_INTERVAL:-5min}"
 THEME_CALENDAR="${XIAMIMATE_THEME_SYNC_TIMER_CALENDAR:-*-*-* 01:00:00}"
 PG_AGG_CALENDAR="${XIAMIMATE_PG_AGG_SYNC_TIMER_CALENDAR:-Sun *-*-* 04:00:00}"
+DEFAULT_TIMEOUT_START_SEC="${XIAMIMATE_SYNC_TIMER_TIMEOUT_START_SEC:-45min}"
+PG_AGG_TIMEOUT_START_SEC="${XIAMIMATE_PG_AGG_SYNC_TIMEOUT_START_SEC:-3h}"
 
 systemd_available() {
     command -v systemctl >/dev/null 2>&1
@@ -108,6 +110,17 @@ log_file_for() {
     esac
 }
 
+timeout_start_sec_for() {
+    case "$1" in
+        pg-agg-sync)
+            echo "$PG_AGG_TIMEOUT_START_SEC"
+            ;;
+        *)
+            echo "$DEFAULT_TIMEOUT_START_SEC"
+            ;;
+    esac
+}
+
 write_service() {
     local job="$1"
     local service_path
@@ -128,7 +141,7 @@ Environment=XIAMIMATE_COLLECTOR_ENV_FILE=$ENV_FILE
 EnvironmentFile=-$ENV_FILE
 ExecStartPre=/bin/mkdir -p $DEFAULT_LOG_DIR
 ExecStart=$(exec_start_for "$job")
-TimeoutStartSec=45min
+TimeoutStartSec=$(timeout_start_sec_for "$job")
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

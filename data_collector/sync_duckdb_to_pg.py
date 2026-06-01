@@ -90,6 +90,10 @@ PG_SYNC_DUCKDB_THREADS = max(1, int(os.environ.get("PG_SYNC_DUCKDB_THREADS", "1"
 PG_SYNC_DUCKDB_MEMORY_LIMIT = os.environ.get("PG_SYNC_DUCKDB_MEMORY_LIMIT", "1536MB")
 PG_SYNC_DUCKDB_READ_MODE = os.environ.get("PG_SYNC_DUCKDB_READ_MODE", "direct").strip().lower()
 PG_SYNC_DUCKDB_COPY_DIR = os.environ.get("PG_SYNC_DUCKDB_COPY_DIR", "").strip()
+PG_SYNC_PROGRESS_LOG_FETCH_BATCHES = max(
+    1,
+    int(os.environ.get("PG_SYNC_PROGRESS_LOG_FETCH_BATCHES", "100")),
+)
 PG_AGG_REFRESH_INTERVAL_SECONDS = max(
     300, int(os.environ.get("PG_AGG_REFRESH_INTERVAL_SECONDS", "3600"))
 )
@@ -100,6 +104,10 @@ PG_SYNC_AGG_PARTITIONED = os.environ.get("PG_SYNC_AGG_PARTITIONED", "false").low
     "on",
 }
 _SYNC_COPY_DIRS: list[Path] = []
+
+
+def _elapsed_seconds(started_at: float) -> float:
+    return round(time.time() - started_at, 1)
 
 HISTORY_DOMAIN_DAILY_SQL_TEMPLATE = """
 SELECT
@@ -124,33 +132,81 @@ GROUP BY 1, 2
 HISTORY_DOMAIN_DAILY_SQL = HISTORY_DOMAIN_DAILY_SQL_TEMPLATE.format(where_clause="")
 
 HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE = """
+WITH scoped_history AS (
+    SELECT
+        h.date,
+        h.domain,
+        h.asin,
+        h.buy_box_price,
+        h.amazon_price,
+        h.new_price,
+        h.bsr,
+        h.rating,
+        h.review_count,
+        h.monthly_sold,
+        h.ingested_at
+    FROM curated.keepa_product_history h
+    {where_clause}
+), registry_roots AS (
+    SELECT
+        asin,
+        domain,
+        COALESCE(root_category_id, category_id, 0) AS root_category_id,
+        category AS registry_root_category_name
+    FROM curated.keepa_asin_registry
+), history_agg AS (
+    SELECT
+        h.date,
+        h.domain,
+        COALESCE(r.root_category_id, 0) AS root_category_id,
+        MAX(r.registry_root_category_name) AS registry_root_category_name,
+        COUNT(*) AS rows_count,
+        COUNT(DISTINCT h.asin) AS asin_count,
+        AVG(COALESCE(h.buy_box_price, h.amazon_price, h.new_price)) AS avg_effective_price,
+        MIN(COALESCE(h.buy_box_price, h.amazon_price, h.new_price)) AS min_effective_price,
+        MAX(COALESCE(h.buy_box_price, h.amazon_price, h.new_price)) AS max_effective_price,
+        AVG(h.bsr) AS avg_bsr,
+        MIN(h.bsr) AS best_bsr,
+        AVG(h.rating) AS avg_rating,
+        AVG(h.review_count) AS avg_review_count,
+        SUM(COALESCE(h.monthly_sold, 0)) AS sum_monthly_sold,
+        AVG(h.monthly_sold) AS avg_monthly_sold,
+        MAX(h.ingested_at) AS aggregated_at
+    FROM scoped_history h
+    LEFT JOIN registry_roots r
+        ON h.asin = r.asin AND h.domain = r.domain
+    GROUP BY 1, 2, 3
+), category_names AS (
+    SELECT
+        category_id,
+        domain,
+        MAX(COALESCE(category_cn, category_en)) AS category_name
+    FROM curated.keepa_category_registry
+    GROUP BY 1, 2
+)
 SELECT
-    h.date,
-    h.domain,
-    COALESCE(r.root_category_id, r.category_id, 0) AS root_category_id,
+    a.date,
+    a.domain,
+    a.root_category_id,
     CASE
-        WHEN COALESCE(r.root_category_id, r.category_id, 0) = 0 THEN 'Unknown'
-        ELSE MAX(COALESCE(c.category_cn, c.category_en, r.category, 'Unknown'))
+        WHEN a.root_category_id = 0 THEN 'Unknown'
+        ELSE COALESCE(c.category_name, a.registry_root_category_name, 'Unknown')
     END AS root_category_name,
-    COUNT(*) AS rows_count,
-    COUNT(DISTINCT h.asin) AS asin_count,
-    AVG(COALESCE(h.buy_box_price, h.amazon_price, h.new_price)) AS avg_effective_price,
-    MIN(COALESCE(h.buy_box_price, h.amazon_price, h.new_price)) AS min_effective_price,
-    MAX(COALESCE(h.buy_box_price, h.amazon_price, h.new_price)) AS max_effective_price,
-    AVG(h.bsr) AS avg_bsr,
-    MIN(h.bsr) AS best_bsr,
-    AVG(h.rating) AS avg_rating,
-    AVG(h.review_count) AS avg_review_count,
-    SUM(COALESCE(h.monthly_sold, 0)) AS sum_monthly_sold,
-    AVG(h.monthly_sold) AS avg_monthly_sold,
-    MAX(h.ingested_at) AS aggregated_at
-FROM curated.keepa_product_history h
-LEFT JOIN curated.keepa_asin_registry r
-    ON h.asin = r.asin AND h.domain = r.domain
-LEFT JOIN curated.keepa_category_registry c
-    ON COALESCE(r.root_category_id, r.category_id) = c.category_id AND h.domain = c.domain
-{where_clause}
-GROUP BY 1, 2, 3
+    a.rows_count,
+    a.asin_count,
+    a.avg_effective_price,
+    a.min_effective_price,
+    a.max_effective_price,
+    a.avg_bsr,
+    a.best_bsr,
+    a.avg_rating,
+    a.avg_review_count,
+    a.sum_monthly_sold,
+    a.avg_monthly_sold,
+    a.aggregated_at
+FROM history_agg a
+LEFT JOIN category_names c
+    ON a.root_category_id = c.category_id AND a.domain = c.domain
 """
 HISTORY_ROOT_CATEGORY_DAILY_SQL = HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE.format(where_clause="")
 
@@ -581,6 +637,7 @@ def _insert_result_batches(
     pk: list[str],
     sql: str,
 ) -> tuple[int, int, int]:
+    started_at = time.time()
     total_rows = 0
     fetch_batch_count = 0
     dropped_duplicate_rows = 0
@@ -610,6 +667,16 @@ def _insert_result_batches(
             )
             total_rows += len(rows)
 
+        if fetch_batch_count % PG_SYNC_PROGRESS_LOG_FETCH_BATCHES == 0:
+            logger.info(
+                "  %s → %s: progress %s rows across %s fetch batches in %ss",
+                duck_table,
+                pg_table,
+                total_rows,
+                fetch_batch_count,
+                _elapsed_seconds(started_at),
+            )
+
         raw_rows = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
 
     return total_rows, fetch_batch_count, dropped_duplicate_rows
@@ -629,21 +696,47 @@ def _sync_partitioned_full_refresh(
         logger.info("  %s → 无分片数据", duck_table)
         return 0
 
+    logger.info(
+        "  %s → %s: partitioned full refresh start (%s partitions, fetch_batch_size=%s, pg_batch_size=%s)",
+        duck_table,
+        pg_table,
+        len(partitions),
+        PG_SYNC_FETCH_BATCH_SIZE,
+        PG_SYNC_BATCH_SIZE,
+    )
     total_rows = 0
     failed_partitions = 0
     for domain, start_date, end_date in partitions:
         partition_label = f"domain={domain} month={start_date}"
+        partition_started_at = time.time()
         try:
             query = _build_partitioned_agg_select(config, int(domain), start_date, end_date)
+            logger.info("  %s → %s [%s]: DuckDB query start", duck_table, pg_table, partition_label)
             result = duck.execute(query)
             _, keep_idx, columns = _prepare_result_columns(result, config)
             first_batch = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
             sql = _build_pg_insert_sql(pg_table, columns, pk)
+            logger.info(
+                "  %s → %s [%s]: first DuckDB batch fetched (%s rows, %ss)",
+                duck_table,
+                pg_table,
+                partition_label,
+                len(first_batch),
+                _elapsed_seconds(partition_started_at),
+            )
 
             with pg_conn.cursor() as cur:
+                delete_started_at = time.time()
                 cur.execute(
                     f"DELETE FROM {pg_table} WHERE domain = %s AND date >= %s AND date < %s",
                     [domain, start_date, end_date],
+                )
+                logger.info(
+                    "  %s → %s [%s]: PG partition delete done in %ss",
+                    duck_table,
+                    pg_table,
+                    partition_label,
+                    _elapsed_seconds(delete_started_at),
                 )
                 if first_batch:
                     rows, fetch_batches, dropped_duplicates = _insert_result_batches(
@@ -673,12 +766,19 @@ def _sync_partitioned_full_refresh(
                 else:
                     logger.info("  %s → %s [%s]: 无数据", duck_table, pg_table, partition_label)
             pg_conn.commit()
+            logger.info(
+                "  %s → %s [%s]: partition committed in %ss",
+                duck_table,
+                pg_table,
+                partition_label,
+                _elapsed_seconds(partition_started_at),
+            )
         except Exception as exc:
             pg_conn.rollback()
             failed_partitions += 1
             logger.warning("  %s → %s [%s] 失败: %s", duck_table, pg_table, partition_label, exc)
 
-    elapsed = round(time.time() - started_at, 1)
+    elapsed = _elapsed_seconds(started_at)
     logger.info(
         "  %s → %s: partitioned full refresh wrote %s rows in %ss (%s partitions, %s failed)",
         duck_table,
@@ -733,9 +833,25 @@ def sync_table(
             query = filtered_query
 
     try:
+        if effective_full:
+            logger.info(
+                "  %s → %s: DuckDB full-refresh query start (fetch_batch_size=%s, pg_batch_size=%s)",
+                duck_table,
+                pg_table,
+                PG_SYNC_FETCH_BATCH_SIZE,
+                PG_SYNC_BATCH_SIZE,
+            )
         result = duck.execute(query)
         source_columns = [desc[0] for desc in result.description]
         first_batch = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
+        if effective_full:
+            logger.info(
+                "  %s → %s: first DuckDB batch fetched (%s rows, %ss)",
+                duck_table,
+                pg_table,
+                len(first_batch),
+                _elapsed_seconds(started_at),
+            )
     except Exception as e:
         logger.warning(f"读取 {duck_table} 失败: {e}")
         return 0
@@ -785,9 +901,25 @@ def sync_table(
             _apply_pg_retention(pg_conn, pg_table, retention_column, int(retention_days))
         # 全量同步: 先清空
         if effective_full and pk:
+            truncate_started_at = time.time()
+            logger.info("  %s → %s: PG truncate start", duck_table, pg_table)
             cur.execute(f"TRUNCATE TABLE {pg_table}")
+            logger.info(
+                "  %s → %s: PG truncate done in %ss",
+                duck_table,
+                pg_table,
+                _elapsed_seconds(truncate_started_at),
+            )
         elif effective_full and not pk:
+            delete_started_at = time.time()
+            logger.info("  %s → %s: PG delete start", duck_table, pg_table)
             cur.execute(f"DELETE FROM {pg_table}")
+            logger.info(
+                "  %s → %s: PG delete done in %ss",
+                duck_table,
+                pg_table,
+                _elapsed_seconds(delete_started_at),
+            )
         elif not effective_full and not pk and ts_col:
             # 无主键表增量: 先删除 >= max_ts 的旧行, 防止重复
             max_ts = _get_pg_max_timestamp(pg_conn, pg_table, ts_col)
@@ -821,10 +953,20 @@ def sync_table(
                 )
                 total_rows += len(rows)
 
+            if fetch_batch_count % PG_SYNC_PROGRESS_LOG_FETCH_BATCHES == 0:
+                logger.info(
+                    "  %s → %s: progress %s rows across %s fetch batches in %ss",
+                    duck_table,
+                    pg_table,
+                    total_rows,
+                    fetch_batch_count,
+                    _elapsed_seconds(started_at),
+                )
+
             raw_rows = result.fetchmany(PG_SYNC_FETCH_BATCH_SIZE)
 
     pg_conn.commit()
-    elapsed = round(time.time() - started_at, 1)
+    elapsed = _elapsed_seconds(started_at)
     duplicate_suffix = ""
     if dropped_duplicate_rows > 0:
         duplicate_suffix = f", dropped {dropped_duplicate_rows} duplicate rows"
