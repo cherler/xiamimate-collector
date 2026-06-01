@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
@@ -10,7 +11,12 @@ from unittest.mock import patch
 import duckdb
 
 from data_collector.sync_duckdb_to_pg import (
+    _AGG_SUBSET_CACHE,
+    _AGG_SUBSET_CONNS,
+    _SYNC_COPY_DIRS,
+    _build_incremental_agg_partitions,
     _build_partitioned_agg_select,
+    _create_incremental_agg_subset_duckdb,
     _defer_theme_sync_after_expansion_reconcile,
     _find_affected_agg_days,
     _reconcile_candidate_expansion_jobs_completion,
@@ -89,6 +95,16 @@ class SyncExpansionJobsTests(unittest.TestCase):
 
 
 class AggIncrementalTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        _AGG_SUBSET_CACHE.clear()
+        while _AGG_SUBSET_CONNS:
+            try:
+                _AGG_SUBSET_CONNS.pop().close()
+            except Exception:
+                pass
+        while _SYNC_COPY_DIRS:
+            shutil.rmtree(_SYNC_COPY_DIRS.pop(), ignore_errors=True)
+
     def test_find_affected_agg_days_uses_ingested_at_and_incremental_date_window(self) -> None:
         conn = duckdb.connect(":memory:")
         self.addCleanup(conn.close)
@@ -155,6 +171,118 @@ class AggIncrementalTests(unittest.TestCase):
                 cutoff_ts=(now_ts - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
                 max_buckets=2,
             )
+
+    def test_create_incremental_agg_subset_keeps_complete_recent_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "source.duckdb"
+            source = duckdb.connect(str(source_path))
+            source.execute("CREATE SCHEMA curated")
+            source.execute(
+                """
+                CREATE TABLE curated.keepa_product_history (
+                    asin TEXT,
+                    domain INTEGER,
+                    date DATE,
+                    ingested_at TIMESTAMP,
+                    buy_box_price DOUBLE,
+                    amazon_price DOUBLE,
+                    new_price DOUBLE,
+                    bsr INTEGER,
+                    rating DOUBLE,
+                    review_count INTEGER,
+                    monthly_sold INTEGER
+                )
+                """
+            )
+            source.execute(
+                """
+                CREATE TABLE curated.keepa_asin_registry (
+                    asin TEXT,
+                    domain INTEGER,
+                    root_category_id INTEGER,
+                    category_id INTEGER,
+                    category TEXT
+                )
+                """
+            )
+            source.execute(
+                """
+                CREATE TABLE curated.keepa_category_registry (
+                    category_id INTEGER,
+                    domain INTEGER,
+                    category_cn TEXT,
+                    category_en TEXT
+                )
+                """
+            )
+            today = date.today()
+            now_ts = datetime.now()
+            stale_ts = now_ts - timedelta(days=30)
+            old_recent_day = today - timedelta(days=44)
+            outside_recent_window_day = today - timedelta(days=60)
+            source.executemany(
+                "INSERT INTO curated.keepa_product_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("changed", 1, today, now_ts, 10, None, None, 100, 4.5, 10, 5),
+                    ("same_bucket", 1, today, stale_ts, 20, None, None, 200, 4.0, 20, 6),
+                    ("other_day", 1, today - timedelta(days=1), stale_ts, 30, None, None, 300, 3.5, 30, 7),
+                    ("stale_domain", 2, old_recent_day, stale_ts, 40, None, None, 400, 3.0, 40, 8),
+                    ("old_changed", 1, outside_recent_window_day, now_ts, 50, None, None, 500, 2.5, 50, 9),
+                ],
+            )
+            source.executemany(
+                "INSERT INTO curated.keepa_asin_registry VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("changed", 1, 10, 10, "Root"),
+                    ("same_bucket", 1, 10, 10, "Root"),
+                    ("other_day", 1, 10, 10, "Root"),
+                    ("stale_domain", 2, 20, 20, "Root 2"),
+                    ("old_changed", 1, 10, 10, "Root"),
+                ],
+            )
+            source.execute("INSERT INTO curated.keepa_category_registry VALUES (10, 1, '根类目', 'Root')")
+            source.execute("INSERT INTO curated.keepa_category_registry VALUES (20, 2, '根类目 2', 'Root 2')")
+            source.close()
+
+            subset, affected_domains, affected_bucket_count = _create_incremental_agg_subset_duckdb(
+                source_path,
+                cutoff_ts=(now_ts - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            self.assertIsNotNone(subset)
+            assert subset is not None
+
+            self.assertEqual(affected_domains, [1])
+            self.assertEqual(affected_bucket_count, 1)
+            self.assertEqual(
+                subset.execute("SELECT COUNT(*) FROM curated.keepa_product_history").fetchone()[0],
+                4,
+            )
+            self.assertEqual(
+                subset.execute("SELECT COUNT(*) FROM curated.keepa_asin_registry").fetchone()[0],
+                4,
+            )
+            self.assertEqual(
+                subset.execute("SELECT COUNT(*) FROM curated.keepa_category_registry").fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                subset.execute("SELECT COUNT(*) FROM curated.keepa_product_history WHERE asin = 'old_changed'").fetchone()[0],
+                0,
+            )
+            subset.close()
+
+    def test_incremental_agg_partitions_use_domain_and_us_months(self) -> None:
+        conn = duckdb.connect(":memory:")
+        self.addCleanup(conn.close)
+
+        partitions = _build_incremental_agg_partitions(conn, [1, 2], date_window_days=45)
+
+        us_partitions = [partition for partition in partitions if partition[0] == 1]
+        other_domain_partitions = [partition for partition in partitions if partition[0] == 2]
+        self.assertGreaterEqual(len(us_partitions), 2)
+        self.assertEqual(len(other_domain_partitions), 1)
+        self.assertIn("recent_45d", other_domain_partitions[0][3])
+        self.assertTrue(all("month=" in partition[3] for partition in us_partitions))
 
     def test_build_partitioned_agg_select_scopes_single_day(self) -> None:
         query = _build_partitioned_agg_select(

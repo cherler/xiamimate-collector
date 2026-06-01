@@ -153,14 +153,15 @@ PG sync 性能说明：
 1. 当前 `sync_duckdb_to_pg.py` 的主要瓶颈通常不是 `keepa_product_history` 小增量，而是两个聚合表：
    - `sync.keepa_history_domain_daily`
    - `sync.keepa_history_root_category_daily`
-2. `run_pg_sync_agg_once.sh` 默认使用 `PG_SYNC_AGG_MODE=incremental`：先根据 `curated.keepa_product_history.ingested_at` 找出最近变化的 `domain/date`，再删除并重算这些日期桶。`PG_SYNC_AGG_LOOKBACK_DAYS` 默认 `14`，用于给同步状态留重叠窗口；没有状态文件时使用 `PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS`，默认同为 `14`。
-3. 增量模式还有两层保护：`PG_SYNC_AGG_INCREMENTAL_DATE_DAYS` 默认只处理最近 `120` 天业务日期，`PG_SYNC_AGG_MAX_AFFECTED_BUCKETS` 默认最多处理 `120` 个 `domain/date` 桶。超过上限会快速失败，避免历史回填把 weekly agg 变成 3 年窗口重算。
-4. 这两个表当前按 `PG_AGG_REFRESH_INTERVAL_SECONDS` 控制最小重刷间隔，默认 `3600` 秒；在间隔未到时，日志会显示 `skipped (refresh interval ... not reached)`，这是预期行为，不是异常。
-5. PostgreSQL 批量写入页大小由 `PG_SYNC_BATCH_SIZE` 控制，默认 `2000`；如果本地机器和 RDS 链路稳定、单批数据量大，可以继续调高测试。
-6. DuckDB 结果读取批次由 `PG_SYNC_FETCH_BATCH_SIZE` 控制，默认 `10000`；它决定 `sync_duckdb_to_pg.py` 每次从 DuckDB 拉多少行进入内存，再拆成 `PG_SYNC_BATCH_SIZE` 小批写入 PostgreSQL。通常应保持 `PG_SYNC_FETCH_BATCH_SIZE >= PG_SYNC_BATCH_SIZE`。
-7. `PG_SYNC_AGG_HISTORY_DAYS` 控制两个历史聚合表的 full/partitioned 修复窗口和保留窗口，默认 `1095` 天。超过窗口的 PG 聚合行会在 agg 刷新时清理，避免继续维护 2011 年以来的长历史。
-8. 需要做历史修复时，可显式设置 `PG_SYNC_AGG_MODE=full` 或运行 `sync_duckdb_to_pg.py --full`。此时若 `PG_SYNC_AGG_PARTITIONED=true`，会按 `domain + month` 分片刷新聚合表，每个分片独立删除、写入和提交；日志会输出分片开始、首批返回、PG delete、批次进度和提交耗时，便于定位卡在 DuckDB 查询、PG 删除、批量 upsert 还是 commit。
-9. 如果需要降低日志量，可调大 `PG_SYNC_AGG_PROGRESS_LOG_FETCH_BATCHES` 或 `PG_SYNC_PROGRESS_LOG_FETCH_BATCHES`。
+2. `run_pg_sync_agg_once.sh` 默认使用 `PG_SYNC_AGG_MODE=incremental`：先根据 `curated.keepa_product_history.ingested_at` 找出最近有变化的 domain，再按 domain 重算最近窗口。`PG_SYNC_AGG_LOOKBACK_DAYS` 默认 `14`，用于给同步状态留重叠窗口；没有状态文件时使用 `PG_SYNC_AGG_INITIAL_LOOKBACK_DAYS`，默认同为 `14`。
+3. 增量模式默认启用 `PG_SYNC_AGG_USE_SUBSET_DUCKDB=true`：先基于 rolling snapshot 创建临时 recent 子 DuckDB，`curated.keepa_product_history` 只拷最近 `PG_SYNC_AGG_INCREMENTAL_DATE_DAYS` 天完整 history 行，registry/category 只保留 recent history 中出现的 asin/domain 和 domain；子库跑完会删除。只拷 changed ASIN 会让 count/avg/sum 失真，所以子库保留完整 recent 窗口。
+4. 增量模式默认 `PG_SYNC_AGG_INCREMENTAL_DATE_DAYS=45`。`PG_SYNC_AGG_MAX_AFFECTED_BUCKETS` 只作为日志观测口径，不再作为硬失败上限；聚合阶段按 domain 分片，`PG_SYNC_AGG_MONTH_PARTITION_DOMAINS=1` 让 US domain 按月分片，其余 domain 一次刷新 45 天窗口。
+5. 这两个表当前按 `PG_AGG_REFRESH_INTERVAL_SECONDS` 控制最小重刷间隔，默认 `3600` 秒；在间隔未到时，日志会显示 `skipped (refresh interval ... not reached)`，这是预期行为，不是异常。
+6. PostgreSQL 批量写入页大小由 `PG_SYNC_BATCH_SIZE` 控制，默认 `2000`；如果本地机器和 RDS 链路稳定、单批数据量大，可以继续调高测试。
+7. DuckDB 结果读取批次由 `PG_SYNC_FETCH_BATCH_SIZE` 控制，默认 `10000`；它决定 `sync_duckdb_to_pg.py` 每次从 DuckDB 拉多少行进入内存，再拆成 `PG_SYNC_BATCH_SIZE` 小批写入 PostgreSQL。通常应保持 `PG_SYNC_FETCH_BATCH_SIZE >= PG_SYNC_BATCH_SIZE`。
+8. `PG_SYNC_AGG_HISTORY_DAYS` 控制两个历史聚合表的 full/partitioned 修复窗口和保留窗口，默认 `1095` 天。超过窗口的 PG 聚合行会在 agg 刷新时清理，避免继续维护 2011 年以来的长历史。
+9. 需要做历史修复时，可显式设置 `PG_SYNC_AGG_MODE=full` 或运行 `sync_duckdb_to_pg.py --full`。此时若 `PG_SYNC_AGG_PARTITIONED=true`，会按 `domain + month` 分片刷新聚合表，每个分片独立删除、写入和提交；日志会输出分片开始、首批返回、PG delete、批次进度和提交耗时，便于定位卡在 DuckDB 查询、PG 删除、批量 upsert 还是 commit。
+10. 如果需要降低日志量，可调大 `PG_SYNC_AGG_PROGRESS_LOG_FETCH_BATCHES` 或 `PG_SYNC_PROGRESS_LOG_FETCH_BATCHES`。
 
 Theme feature sync 性能说明：
 
