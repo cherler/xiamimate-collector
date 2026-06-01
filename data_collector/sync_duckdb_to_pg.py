@@ -97,6 +97,7 @@ PG_SYNC_PROGRESS_LOG_FETCH_BATCHES = max(
 PG_AGG_REFRESH_INTERVAL_SECONDS = max(
     300, int(os.environ.get("PG_AGG_REFRESH_INTERVAL_SECONDS", "3600"))
 )
+PG_SYNC_AGG_HISTORY_DAYS = max(30, int(os.environ.get("PG_SYNC_AGG_HISTORY_DAYS", "1095")))
 PG_SYNC_AGG_PARTITIONED = os.environ.get("PG_SYNC_AGG_PARTITIONED", "false").lower() in {
     "1",
     "true",
@@ -108,6 +109,9 @@ _SYNC_COPY_DIRS: list[Path] = []
 
 def _elapsed_seconds(started_at: float) -> float:
     return round(time.time() - started_at, 1)
+
+
+HISTORY_AGG_WHERE_CLAUSE = f"WHERE h.date >= CURRENT_DATE - INTERVAL '{PG_SYNC_AGG_HISTORY_DAYS} days'"
 
 HISTORY_DOMAIN_DAILY_SQL_TEMPLATE = """
 SELECT
@@ -129,7 +133,7 @@ FROM curated.keepa_product_history h
 {where_clause}
 GROUP BY 1, 2
 """
-HISTORY_DOMAIN_DAILY_SQL = HISTORY_DOMAIN_DAILY_SQL_TEMPLATE.format(where_clause="")
+HISTORY_DOMAIN_DAILY_SQL = HISTORY_DOMAIN_DAILY_SQL_TEMPLATE.format(where_clause=HISTORY_AGG_WHERE_CLAUSE)
 
 HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE = """
 WITH scoped_history AS (
@@ -208,14 +212,15 @@ FROM history_agg a
 LEFT JOIN category_names c
     ON a.root_category_id = c.category_id AND a.domain = c.domain
 """
-HISTORY_ROOT_CATEGORY_DAILY_SQL = HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE.format(where_clause="")
+HISTORY_ROOT_CATEGORY_DAILY_SQL = HISTORY_ROOT_CATEGORY_DAILY_SQL_TEMPLATE.format(where_clause=HISTORY_AGG_WHERE_CLAUSE)
 
-HISTORY_MONTH_PARTITIONS_SQL = """
+HISTORY_MONTH_PARTITIONS_SQL = f"""
 SELECT
     domain,
     date_trunc('month', date)::DATE AS start_date,
     (date_trunc('month', date) + INTERVAL '1 month')::DATE AS end_date
 FROM curated.keepa_product_history
+WHERE date >= CURRENT_DATE - INTERVAL '{PG_SYNC_AGG_HISTORY_DAYS} days'
 GROUP BY 1, 2, 3
 ORDER BY 1, 2
 """
@@ -251,6 +256,8 @@ SYNC_TABLES = {
         "always_full_refresh": True,
         "full_refresh_partition_values_sql": HISTORY_MONTH_PARTITIONS_SQL if PG_SYNC_AGG_PARTITIONED else None,
         "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
+        "retention_days": PG_SYNC_AGG_HISTORY_DAYS,
+        "retention_column": "date",
     },
     "agg.keepa_history_root_category_daily": {
         "pg_table": "sync.keepa_history_root_category_daily",
@@ -261,6 +268,8 @@ SYNC_TABLES = {
         "always_full_refresh": True,
         "full_refresh_partition_values_sql": HISTORY_MONTH_PARTITIONS_SQL if PG_SYNC_AGG_PARTITIONED else None,
         "min_sync_interval_seconds": PG_AGG_REFRESH_INTERVAL_SECONDS,
+        "retention_days": PG_SYNC_AGG_HISTORY_DAYS,
+        "retention_column": "date",
     },
     "curated.google_trends_daily": {
         "pg_table": "sync.google_trends_daily",
@@ -692,6 +701,20 @@ def _sync_partitioned_full_refresh(
     pg_table = config["pg_table"]
     pk = config["pk"]
     partitions = duck.execute(config["full_refresh_partition_values_sql"]).fetchall()
+    retention_days = config.get("retention_days")
+    retention_column = config.get("retention_column")
+    if retention_days and retention_column:
+        retention_started_at = time.time()
+        _apply_pg_retention(pg_conn, pg_table, retention_column, int(retention_days))
+        pg_conn.commit()
+        logger.info(
+            "  %s → %s: PG retention delete done for %s older than %s days in %ss",
+            duck_table,
+            pg_table,
+            retention_column,
+            retention_days,
+            _elapsed_seconds(retention_started_at),
+        )
     if not partitions:
         logger.info("  %s → 无分片数据", duck_table)
         return 0
