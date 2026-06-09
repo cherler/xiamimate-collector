@@ -170,6 +170,68 @@ class KeepaTokenAllocatorTests(unittest.TestCase):
 
         self.assertIsNone(store.peek_next_interactive_job_domain(domains=[]))
 
+    def test_requeue_stale_discovering_jobs_resets_orphans(self) -> None:
+        from data_collector.cross_border_data.expansion_jobs import ExpansionJobStore
+
+        class _Cursor:
+            def __init__(self) -> None:
+                self.statements: list[tuple[str, list[object] | None]] = []
+
+            def __enter__(self) -> "_Cursor":
+                return self
+
+            def __exit__(self, *args) -> None:  # noqa: ANN002
+                return None
+
+            def execute(self, sql: str, params: list[object] | None = None) -> None:
+                self.statements.append((sql, params))
+
+            def fetchall(self) -> list[tuple[str]]:
+                return [("kexp_1",), ("kexp_2",)]
+
+        class _Conn:
+            def __init__(self) -> None:
+                self.cursor_obj = _Cursor()
+                self.closed = False
+
+            def __enter__(self) -> "_Conn":
+                return self
+
+            def __exit__(self, *args) -> None:  # noqa: ANN002
+                return None
+
+            def cursor(self, *args, **kwargs) -> _Cursor:  # noqa: ANN002, ANN003
+                return self.cursor_obj
+
+            def close(self) -> None:
+                self.closed = True
+
+        store = ExpansionJobStore()
+        store.enabled = True
+        conn = _Conn()
+        store._connect = lambda: conn  # type: ignore[method-assign]
+
+        count = store.requeue_stale_discovering_jobs(stale_minutes=30, domains=[4, 1])
+
+        self.assertEqual(count, 2)
+        sql, params = conn.cursor_obj.statements[0]
+        self.assertIn("status = 'discovering'", sql)
+        self.assertIn("SET status = 'queued'", sql)
+        self.assertIn("make_interval(mins => %s)", sql)
+        self.assertIn("domain = ANY(%s)", sql)
+        # 入参顺序：先 stale_minutes，再归一化排序后的 domains
+        self.assertEqual(params, [30, [1, 4]])
+        self.assertTrue(conn.closed)
+
+    def test_requeue_stale_discovering_jobs_empty_domain_skips_query(self) -> None:
+        from data_collector.cross_border_data.expansion_jobs import ExpansionJobStore
+
+        store = ExpansionJobStore()
+        store.enabled = True
+        store._connect = lambda: self.fail("empty domain filter should not connect")  # type: ignore[method-assign]
+
+        self.assertEqual(store.requeue_stale_discovering_jobs(domains=[]), 0)
+
     def test_auto_discovery_keeps_interactive_reserve(self) -> None:
         allocator = KeepaTokenAllocator(
             KeepaTokenBudget(

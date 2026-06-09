@@ -103,6 +103,50 @@ class ExpansionJobStore:
         finally:
             conn.close()
 
+    def requeue_stale_discovering_jobs(
+        self, *, stale_minutes: int = 30, domains: list[int] | None = None
+    ) -> int:
+        """把卡在 'discovering' 且超过 stale_minutes 未更新的补池任务重置回 'queued'。
+
+        'discovering' 是 claim 之后、mark_hydrating / mark_waiting_token / mark_failed 之前的
+        进程内瞬时状态，只有 collector 在该阶段崩溃/被杀才会长期滞留。这类孤儿任务不会被任何
+        claim 方法重新领取（claim_next_interactive_job 只领 queued/waiting_token，
+        claim_next_hydration_job 只领 hydrating），会永久滞留、永远无法 completed。
+        定期把它们重置回 queued，让其可被重新领取，打破"补池任务卡死"路径。
+        返回被重置的任务数。
+        """
+        if not self.enabled:
+            return 0
+        normalized_domains = sorted({int(domain) for domain in domains or []})
+        if domains is not None and not normalized_domains:
+            return 0
+        conn = self._connect()
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    params: list[Any] = [int(stale_minutes)]
+                    domain_filter = ""
+                    if normalized_domains:
+                        domain_filter = "AND domain = ANY(%s)"
+                        params.append(normalized_domains)
+                    cursor.execute(
+                        f"""
+                        UPDATE sync.keepa_candidate_expansion_jobs
+                        SET status = 'queued',
+                            status_reason = 'requeued stale discovering job (worker likely interrupted)',
+                            updated_at = NOW()
+                        WHERE status = 'discovering'
+                          AND priority IN ('interactive_high', 'interactive_normal')
+                          AND updated_at < NOW() - make_interval(mins => %s)
+                          {domain_filter}
+                        RETURNING job_id
+                        """,
+                        params,
+                    )
+                    return len(cursor.fetchall())
+        finally:
+            conn.close()
+
     def claim_next_interactive_job(self, *, domain: int) -> ExpansionJob | None:
         if not self.enabled:
             return None

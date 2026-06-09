@@ -2553,6 +2553,12 @@ def run_multi_domain_collect_loop(
     total_tokens = 0
     expansion_job_store = ExpansionJobStore()
 
+    # 抢占公平阀：连续这么多次"补池抢占无进展"后，强制让正常跨域采集推进一轮，
+    # 避免被 waiting_token / 无法 hydrate 的补池任务把整个多域循环永久锁死在单个 domain、
+    # 饿死其他 domain 的正常采集。计数跨域累计，一旦有抢占取得进展即清零。
+    preempt_stall_fairness_limit = 3
+    preempt_stall_streak = 0
+
     collect_kwargs = dict(
         keepa_api_key=keepa_api_key,
         keepa_base_url=keepa_base_url,
@@ -2574,6 +2580,17 @@ def run_multi_domain_collect_loop(
             _raise_if_shutdown_requested()
             round_num += 1
             logger.info(f"--- 第 {round_num} 轮 (全站点) ---")
+
+            # 周期性回收卡在 'discovering' 的孤儿补池任务（worker 中途崩溃留下的），让其可被重新领取，
+            # 避免任务永久滞留、队列看似"一直有任务"却无法推进。
+            try:
+                requeued = expansion_job_store.requeue_stale_discovering_jobs(domains=target_domains)
+                if requeued:
+                    logger.warning(
+                        f"  已重置 {requeued} 个卡住的 discovering 补池任务回 queued (worker 疑似中断)"
+                    )
+            except Exception as exc:
+                logger.warning(f"重置卡住补池任务失败: {exc}")
 
             for domain in target_domains:
                 _raise_if_shutdown_requested()
@@ -2598,33 +2615,46 @@ def run_multi_domain_collect_loop(
                         except Exception as exc:
                             logger.warning(f"读取全局补池抢占队列失败: {exc}")
                         if preempt_domain is not None and preempt_domain != domain:
-                            preempt_geo = geo_names.get(preempt_domain, KEEPA_DOMAIN_TO_GEO.get(preempt_domain, "?"))
-                            logger.info(
-                                f"  !! 检测到 Domain {preempt_domain}/{preempt_geo} 交互式补池任务, "
-                                f"暂停 Domain {domain}/{geo} 普通采集并先处理补池"
-                            )
-                            preempt_stats = run_auto_collect(
-                                domain=preempt_domain,
-                                **collect_kwargs,
-                            )
-                            _raise_if_shutdown_requested()
-                            preempt_fetched = preempt_stats.get("asins_fetched", 0)
-                            preempt_discovered = preempt_stats.get("asins_discovered", 0)
-                            preempt_consumed = preempt_stats.get("tokens_consumed", 0)
-                            total_asins += preempt_fetched
-                            total_tokens += preempt_consumed
-                            logger.info(
-                                f"  !! Domain {preempt_domain}/{preempt_geo} 补池抢占轮完成: "
-                                f"发现 {preempt_discovered} ASIN, 采集 {preempt_fetched} ASIN, "
-                                f"消耗 {preempt_consumed} token"
-                            )
-                            if preempt_fetched == 0 and preempt_discovered == 0:
-                                logger.info(
-                                    f"  !! Domain {preempt_domain}/{preempt_geo} 补池抢占轮暂无进展, "
-                                    f"等待 {interval_minutes} 分钟后重试"
+                            if preempt_stall_streak >= preempt_stall_fairness_limit:
+                                # 抢占公平阀：连续多次抢占都无进展（通常补池任务卡在 waiting_token /
+                                # 无法 hydrate），本轮跳过抢占、让 Domain {domain} 的正常采集推进一次，
+                                # 避免被无法推进的补池任务永久饿死跨域采集。随后清零，下一轮恢复抢占优先。
+                                logger.warning(
+                                    f"  !! 补池抢占连续 {preempt_stall_streak} 次无进展, "
+                                    f"本轮让 Domain {domain}/{geo} 正常采集推进一次以避免跨域饥饿"
                                 )
-                                _sleep_until_shutdown_or_timeout(interval_minutes * 60)
-                            continue
+                                preempt_stall_streak = 0
+                            else:
+                                preempt_geo = geo_names.get(preempt_domain, KEEPA_DOMAIN_TO_GEO.get(preempt_domain, "?"))
+                                logger.info(
+                                    f"  !! 检测到 Domain {preempt_domain}/{preempt_geo} 交互式补池任务, "
+                                    f"暂停 Domain {domain}/{geo} 普通采集并先处理补池"
+                                )
+                                preempt_stats = run_auto_collect(
+                                    domain=preempt_domain,
+                                    **collect_kwargs,
+                                )
+                                _raise_if_shutdown_requested()
+                                preempt_fetched = preempt_stats.get("asins_fetched", 0)
+                                preempt_discovered = preempt_stats.get("asins_discovered", 0)
+                                preempt_consumed = preempt_stats.get("tokens_consumed", 0)
+                                total_asins += preempt_fetched
+                                total_tokens += preempt_consumed
+                                logger.info(
+                                    f"  !! Domain {preempt_domain}/{preempt_geo} 补池抢占轮完成: "
+                                    f"发现 {preempt_discovered} ASIN, 采集 {preempt_fetched} ASIN, "
+                                    f"消耗 {preempt_consumed} token"
+                                )
+                                if preempt_fetched == 0 and preempt_discovered == 0:
+                                    preempt_stall_streak += 1
+                                    logger.info(
+                                        f"  !! Domain {preempt_domain}/{preempt_geo} 补池抢占轮暂无进展 "
+                                        f"(连续 {preempt_stall_streak} 次), 等待 {interval_minutes} 分钟后重试"
+                                    )
+                                    _sleep_until_shutdown_or_timeout(interval_minutes * 60)
+                                else:
+                                    preempt_stall_streak = 0
+                                continue
 
                         stats = run_auto_collect(
                             domain=domain,
