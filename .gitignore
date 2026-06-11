@@ -11,3 +11,6 @@ data_platform/storage/raw/json/products/*
 data_platform/storage/raw/*
 *code-workspace
 data_collector/.env.bak*
+data_collector/.env.*.bak*
+.deploy-bak/
+

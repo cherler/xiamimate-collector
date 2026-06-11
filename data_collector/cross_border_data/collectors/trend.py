@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from io import StringIO
 import csv
 import warnings
@@ -86,6 +86,143 @@ class GoogleTrendsCollector:
                     }
                 )
         return rows
+
+
+class SerpApiTrendsCollector(BaseCollector):
+    """Google Trends 替代数据源兜底：通过 SerpApi 的 google_trends 引擎获取趋势。
+
+    当主链路 pytrends 直连/代理持续 429 或网络异常时作为兜底，输出与
+    ``GoogleTrendsCollector.fetch_interest_over_time`` 完全一致的行结构，
+    以便复用同一套 ``DuckDBStorage.ingest_google_trends`` 写入逻辑。
+
+    需要环境变量 ``SERPAPI_API_KEY``（或构造参数 ``api_key``）。未配置时
+    调度侧不会实例化本采集器。
+    """
+
+    BASE_URL = "https://serpapi.com/search.json"
+
+    def __init__(
+        self,
+        api_key: str,
+        hl: str = "en-US",
+        timeout: int = 30,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.api_key = (api_key or "").strip()
+        self.hl = hl or "en-US"
+        if not self.api_key:
+            raise CollectorError("SerpApiTrendsCollector requires a non-empty api_key.")
+
+    def fetch_interest_over_time(
+        self,
+        *,
+        keywords: list[str],
+        timeframe: str = "today 3-m",
+        geo: str = "",
+        category: int = 0,
+        gprop: str = "",
+    ) -> list[dict]:
+        if not keywords:
+            return []
+
+        params: dict[str, str] = {
+            "engine": "google_trends",
+            "q": ",".join(keywords),
+            "data_type": "TIMESERIES",
+            "date": timeframe,
+            "hl": self.hl,
+            "api_key": self.api_key,
+        }
+        if geo:
+            params["geo"] = geo
+        if category:
+            params["cat"] = str(category)
+        if gprop:
+            params["gprop"] = gprop
+
+        payload = self.get_json(self.BASE_URL, params=params)
+        if not isinstance(payload, dict):
+            raise CollectorError("SerpApi returned an unexpected payload type.")
+        if payload.get("error"):
+            raise CollectorError("SerpApi error: %s" % payload.get("error"))
+
+        interest = payload.get("interest_over_time") or {}
+        timeline = interest.get("timeline_data") or []
+        if not timeline:
+            raise CollectorError("SerpApi returned no timeline_data for the given keywords.")
+
+        update_time = utc_now_text()
+        rows: list[dict] = []
+        for point in timeline:
+            if not isinstance(point, dict):
+                continue
+            point_date, timestamp_text = self._resolve_point_date(point)
+            if point_date is None:
+                continue
+            values = point.get("values") or []
+            value_by_query = {
+                str(item.get("query")): item
+                for item in values
+                if isinstance(item, dict) and item.get("query") is not None
+            }
+            for index, keyword in enumerate(keywords):
+                item = value_by_query.get(keyword)
+                if item is None and index < len(values) and isinstance(values[index], dict):
+                    item = values[index]
+                trend_index = None
+                is_partial = False
+                if isinstance(item, dict):
+                    trend_index = as_float(
+                        item.get("extracted_value")
+                        if item.get("extracted_value") is not None
+                        else item.get("value")
+                    )
+                    is_partial = bool(item.get("partial_data") or item.get("is_partial"))
+                rows.append(
+                    {
+                        "source": "SerpApi Google Trends",
+                        "country": geo or "GLOBAL",
+                        "keyword_or_domain": keyword,
+                        "data_type": "keyword",
+                        "date": iso_date(point_date),
+                        "trend_index": trend_index,
+                        "search_volume": None,
+                        "cpc": None,
+                        "estimated_traffic": None,
+                        "traffic_source": "Search Trend",
+                        "backlinks": None,
+                        "referring_domains": None,
+                        "ranking_position": None,
+                        "update_time": update_time,
+                        "source_url": "https://trends.google.com",
+                        "is_partial": is_partial,
+                        "google_trends_timestamp": timestamp_text,
+                    }
+                )
+        if not rows:
+            raise CollectorError("SerpApi timeline_data produced no usable rows.")
+        return rows
+
+    @staticmethod
+    def _resolve_point_date(point: dict) -> tuple[date | None, str]:
+        raw_ts = point.get("timestamp")
+        if raw_ts is not None:
+            try:
+                dt = datetime.fromtimestamp(int(raw_ts), tz=timezone.utc)
+                return dt.date(), dt.isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        raw_date = point.get("date")
+        if raw_date:
+            # SerpApi 日粒度形如 "Mar 9, 2025"；周粒度形如 "Mar 9 – 15, 2025"。
+            text = str(raw_date).split("–")[0].split("-")[0].strip().rstrip(",").strip()
+            for fmt in ("%b %d, %Y", "%b %d %Y", "%Y-%m-%d"):
+                try:
+                    parsed = datetime.strptime(text, fmt).date()
+                    return parsed, str(raw_date)
+                except ValueError:
+                    continue
+        return None, str(point.get("date") or "")
 
 
 class SemrushCollector(BaseCollector):

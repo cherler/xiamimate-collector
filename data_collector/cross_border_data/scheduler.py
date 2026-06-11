@@ -349,6 +349,26 @@ class AutoCollector:
             or os.environ.get("GOOGLE_TRENDS_MIHOMO_SECRET")
             or ""
         ).strip()
+        # 主动养 IP：每成功采集 N 批就主动切到下一个 Mihomo 节点，分摊单 IP 的请求频率，
+        # 降低被 Google 标记限流的概率（0 = 关闭主动轮换，仅在 429/网络异常时被动切换）。
+        try:
+            self.google_trends_rotate_every_n_batches = max(
+                0,
+                int(os.environ.get("AUTO_GOOGLE_TRENDS_ROTATE_EVERY_N_BATCHES", "0") or "0"),
+            )
+        except ValueError:
+            self.google_trends_rotate_every_n_batches = 0
+        # 替代数据源兜底：pytrends 直连/代理持续失败时，改用 SerpApi google_trends 引擎。
+        # 未配置 SERPAPI_API_KEY 时兜底自动关闭，不影响主链路。
+        self.google_trends_fallback_provider = (
+            os.environ.get("AUTO_GOOGLE_TRENDS_FALLBACK_PROVIDER")
+            or ("serpapi" if os.environ.get("SERPAPI_API_KEY") else "")
+        ).strip().lower()
+        self.google_trends_serpapi_key = (
+            os.environ.get("AUTO_GOOGLE_TRENDS_SERPAPI_KEY")
+            or os.environ.get("SERPAPI_API_KEY")
+            or ""
+        ).strip()
         log_dir = Path(os.environ.get("XIAMIMATE_LOG_DIR", "logs")).expanduser()
         self.business_priority_refresh_state_file = (
             log_dir / f"business_priority_refresh_domain_{self.domain}.state"
@@ -377,6 +397,9 @@ class AutoCollector:
         self._trends_keyword_queue: list[str] = []
         self._trends_fetched_keywords: set[str] = set()  # 本轮已采集, 避免重复
         self._trends_collector = None  # lazy init
+        self._trends_fallback_collector = None  # 替代数据源兜底, lazy init
+        self._trends_fallback_disabled = False  # 兜底初始化失败后不再重试
+        self._trends_batches_since_rotation = 0  # 主动轮换计数器
 
         # 运行统计
         self._stats: dict[str, Any] = {
@@ -2047,7 +2070,7 @@ class AutoCollector:
     def _fetch_trends_batch(self, *, batch: list[str], geo: str) -> list[dict]:
         collector = self._get_trends_collector()
         if collector is None:
-            return []
+            return self._fetch_trends_fallback_batch(batch=batch, geo=geo)
 
         try:
             return collector.fetch_interest_over_time(
@@ -2057,10 +2080,17 @@ class AutoCollector:
             )
         except Exception as exc:
             if self._is_google_trends_rate_error(exc) or not self._is_google_trends_transport_error(exc):
+                # 限流(429) 或非传输类错误：先尝试替代数据源兜底，拿不到再向上抛。
+                fallback_rows = self._fetch_trends_fallback_batch(batch=batch, geo=geo)
+                if fallback_rows:
+                    return fallback_rows
                 raise
             reason = str(exc).splitlines()[0][:180]
             switched = self._rotate_google_trends_proxy_node()
             if not switched:
+                fallback_rows = self._fetch_trends_fallback_batch(batch=batch, geo=geo)
+                if fallback_rows:
+                    return fallback_rows
                 raise
             self._trends_collector = self._create_trends_collector()
             logger.info("Google Trends 网络异常，已切换 Mihomo 节点后重试: %s", reason)
@@ -2068,6 +2098,64 @@ class AutoCollector:
                 keywords=batch,
                 timeframe=self._trends_timeframe(),
                 geo=geo,
+            )
+
+    def _get_trends_fallback_collector(self):
+        """Lazy init 替代数据源兜底 (当前支持 SerpApi google_trends)。"""
+        if self._trends_fallback_disabled:
+            return None
+        if self._trends_fallback_collector is not None:
+            return self._trends_fallback_collector
+        if self.google_trends_fallback_provider != "serpapi" or not self.google_trends_serpapi_key:
+            self._trends_fallback_disabled = True
+            return None
+        try:
+            from .collectors import SerpApiTrendsCollector
+
+            hl = self._DOMAIN_TO_HL.get(self.domain, "en-US")
+            self._trends_fallback_collector = SerpApiTrendsCollector(
+                api_key=self.google_trends_serpapi_key,
+                hl=hl,
+            )
+            logger.info("Google Trends 替代数据源兜底已就绪: SerpApi (hl=%s)", hl)
+        except Exception as e:  # noqa: BLE001
+            self._trends_fallback_disabled = True
+            logger.warning("Google Trends 替代数据源兜底初始化失败，已禁用: %s", str(e).splitlines()[0][:180])
+            return None
+        return self._trends_fallback_collector
+
+    def _fetch_trends_fallback_batch(self, *, batch: list[str], geo: str) -> list[dict]:
+        """通过替代数据源采集一批关键词；失败时返回空列表（不抛出，交由上层走被动冷却）。"""
+        collector = self._get_trends_fallback_collector()
+        if collector is None:
+            return []
+        try:
+            rows = collector.fetch_interest_over_time(
+                keywords=batch,
+                timeframe=self._trends_timeframe(),
+                geo=geo,
+            )
+            if rows:
+                logger.info("  [兜底] SerpApi Google Trends: %s → %s 行", batch, len(rows))
+            return rows
+        except Exception as e:  # noqa: BLE001
+            logger.warning("  [兜底] SerpApi 采集失败: %s", str(e).splitlines()[0][:180])
+            return []
+
+    def _maybe_rotate_trends_proxy_proactively(self) -> None:
+        """主动养 IP：累计成功批次达到阈值后主动切到下一个 Mihomo 节点。"""
+        if self.google_trends_rotate_every_n_batches <= 0:
+            return
+        self._trends_batches_since_rotation += 1
+        if self._trends_batches_since_rotation < self.google_trends_rotate_every_n_batches:
+            return
+        self._trends_batches_since_rotation = 0
+        if self._rotate_google_trends_proxy_node():
+            # 切节点后让 collector 在下次请求时按新节点重建。
+            self._trends_collector = None
+            logger.info(
+                "Google Trends 主动轮换：已切换到下一个 Mihomo 节点 (每 %s 批)",
+                self.google_trends_rotate_every_n_batches,
             )
 
     def _fetch_trends_during_wait(self, wait_secs: float) -> None:
@@ -2119,6 +2207,7 @@ class AutoCollector:
                     logger.info(f"  [等待期] Google Trends: {batch} → {ingested} 行")
                 self._trends_fetched_keywords.update(batch)
                 batches_done += 1
+                self._maybe_rotate_trends_proxy_proactively()
                 if self.google_trends_request_interval_seconds > 0 and self._trends_keyword_queue:
                     time.sleep(min(self.google_trends_request_interval_seconds, max(0.0, deadline - time.time())))
             except Exception as e:
@@ -2130,7 +2219,6 @@ class AutoCollector:
                 )
                 if should_break:
                     break
-
         # 剩余时间继续等待 (确保 token 有时间恢复)
         remaining = deadline - time.time()
         if remaining > 0:
@@ -2219,6 +2307,7 @@ class AutoCollector:
                         logger.info(f"  Google Trends: {batch} → {ingested} 行")
                     self._trends_fetched_keywords.update(batch)
                     batches_done += 1
+                    self._maybe_rotate_trends_proxy_proactively()
                     if self.google_trends_request_interval_seconds > 0 and i + self.google_trends_batch_size < len(keywords_list):
                         time.sleep(self.google_trends_request_interval_seconds)
                 except Exception as e:
