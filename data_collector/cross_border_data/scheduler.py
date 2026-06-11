@@ -372,6 +372,16 @@ class AutoCollector:
             ).split(",")
             if token.strip()
         ]
+        # 429/网络异常时在白名单节点间连续切换重试的次数。专线节点是机场共享的、间歇被限流，
+        # 一次 429 就锁死 900s 冷却会让命中可用节点的机会极低；改为单次采集内最多换 N 个节点重试，
+        # 全部失败才进冷却。0 = 关闭跨节点重试(仅原有的单次被动切换行为)。
+        try:
+            self.google_trends_node_retry_attempts = max(
+                0,
+                int(os.environ.get("AUTO_GOOGLE_TRENDS_NODE_RETRY_ATTEMPTS", "4") or "4"),
+            )
+        except ValueError:
+            self.google_trends_node_retry_attempts = 4
         # 主动养 IP：每成功采集 N 批就主动切到下一个 Mihomo 节点，分摊单 IP 的请求频率，
         # 降低被 Google 标记限流的概率（0 = 关闭主动轮换，仅在 429/网络异常时被动切换）。
         try:
@@ -2382,26 +2392,48 @@ class AutoCollector:
                 geo=geo,
             )
         except Exception as exc:
-            if self._is_google_trends_rate_error(exc) or not self._is_google_trends_transport_error(exc):
-                # 限流(429) 或非传输类错误：先尝试替代数据源兜底，拿不到再向上抛。
+            is_rate = self._is_google_trends_rate_error(exc)
+            is_transport = self._is_google_trends_transport_error(exc)
+            if not is_rate and not is_transport:
+                # 非限流/非传输类错误：先尝试替代数据源兜底，拿不到再向上抛。
                 fallback_rows = self._fetch_trends_fallback_batch(batch=batch, geo=geo)
                 if fallback_rows:
                     return fallback_rows
                 raise
-            reason = str(exc).splitlines()[0][:180]
-            switched = self._rotate_google_trends_proxy_node()
-            if not switched:
-                fallback_rows = self._fetch_trends_fallback_batch(batch=batch, geo=geo)
-                if fallback_rows:
-                    return fallback_rows
-                raise
-            self._trends_collector = self._create_trends_collector()
-            logger.info("Google Trends 网络异常，已切换 Mihomo 节点后重试: %s", reason)
-            return self._trends_collector.fetch_interest_over_time(
-                keywords=batch,
-                timeframe=self._trends_timeframe(),
-                geo=geo,
-            )
+
+            # 限流(429) 或传输异常(SSL/连接重置)：专线节点是机场共享的、间歇被限流，
+            # 在白名单节点间连续切换重试若干次，命中可用节点的概率远高于"一次失败就冷却 900s"。
+            last_exc = exc
+            for attempt in range(1, self.google_trends_node_retry_attempts + 1):
+                switched = self._rotate_google_trends_proxy_node()
+                if not switched:
+                    break
+                try:
+                    self._trends_collector = self._create_trends_collector()
+                    rows = self._trends_collector.fetch_interest_over_time(
+                        keywords=batch,
+                        timeframe=self._trends_timeframe(),
+                        geo=geo,
+                    )
+                    logger.info(
+                        "Google Trends 切换节点后重试成功 (第 %s 次重试)",
+                        attempt,
+                    )
+                    return rows
+                except Exception as retry_exc:  # noqa: BLE001
+                    last_exc = retry_exc
+                    logger.info(
+                        "Google Trends 第 %s 次换节点重试仍失败: %s",
+                        attempt,
+                        str(retry_exc).splitlines()[0][:120],
+                    )
+                    continue
+
+            # 跨节点重试用尽，最后尝试替代数据源兜底，仍拿不到则抛出由上层进入冷却。
+            fallback_rows = self._fetch_trends_fallback_batch(batch=batch, geo=geo)
+            if fallback_rows:
+                return fallback_rows
+            raise last_exc
 
     def _get_trends_fallback_collector(self):
         """Lazy init 替代数据源兜底 (当前支持 SerpApi google_trends)。"""
