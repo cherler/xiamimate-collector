@@ -39,6 +39,7 @@ from typing import Any
 
 from .asin_discovery import (
     KeepaAsinDiscovery,
+    PRODUCT_FINDER_TOKENS_PER_QUERY,
     SEARCH_PRODUCTS_TOKENS_PER_PAGE,
     extract_keywords_from_title,
     load_seed_asins,
@@ -51,7 +52,7 @@ from .collectors.product import (
 )
 from .expansion_jobs import ExpansionJob, ExpansionJobStore
 from .seller_scope import evaluate_seller_scope, filter_seller_scope_keywords
-from .storage import DuckDBStorage
+from .storage import DuckDBStorage, _DOMAIN_PRICE_BANDS
 from .token_allocator import KeepaTokenAllocator
 
 logger = logging.getLogger(__name__)
@@ -374,6 +375,9 @@ class AutoCollector:
             log_dir / f"business_priority_refresh_domain_{self.domain}.state"
         )
         self.google_trends_cooldown_state_file = log_dir / f"google_trends_cooldown_domain_{self.domain}.state"
+        self.product_finder_cooldown_state_file = (
+            log_dir / f"product_finder_cooldown_domain_{self.domain}.state"
+        )
         self.seed_file = seed_file
         self.categories = categories or _load_categories_for_domain(domain)
         self.search_terms = search_terms or []
@@ -998,7 +1002,14 @@ class AutoCollector:
 
         if next_cat is None:
             logger.info("当前没有到期的 L1 BestSeller 刷新类目, 无新类目可发现")
-            # 注册种子 ASIN (如果有)
+            # 发现源兜底: BestSeller 枯竭 / 全部在冷却期时, 用 Keepa Product Finder
+            # 按价格/销量/排名等结构化条件批量发现新 ASIN (受 token 预算与冷却约束)。
+            pf_discovered = self._discover_via_product_finder(
+                interactive_pending=interactive_pending
+            )
+            if pf_discovered:
+                all_discovered.extend(pf_discovered)
+            # 注册种子 / Product Finder 发现的 ASIN (如果有)
             if all_discovered:
                 new_count = self.storage.register_asins(all_discovered)
                 self._stats["asins_discovered"] = new_count
@@ -1039,8 +1050,13 @@ class AutoCollector:
             all_asins, raw_payload = self.discovery.fetch_best_sellers(
                 category=cat_id, domain=self.domain
             )
-            # 只取 top 100 ASIN, 并保持原始排名顺序去重。
-            asins = list(dict.fromkeys(all_asins))[:100]
+            # 取 top N ASIN (默认 200, 经 AUTO_BESTSELLER_TOP_N 可调), 保持原始排名顺序去重。
+            # BestSeller API 单次固定 50 token, 加深抓取不增加发现成本; 仅扩大注册池供后续按预算采历史。
+            try:
+                bestseller_top_n = max(1, int(os.environ.get("AUTO_BESTSELLER_TOP_N", "200") or "200"))
+            except ValueError:
+                bestseller_top_n = 200
+            asins = list(dict.fromkeys(all_asins))[:bestseller_top_n]
             existing_count = self.storage.count_registered_asins(asins, self.domain)
             new_count = max(0, len(asins) - existing_count)
             new_rate = (new_count / len(asins)) if asins else 0.0
@@ -1151,6 +1167,183 @@ class AutoCollector:
             new_count = self.storage.register_asins(all_discovered)
             self._stats["asins_discovered"] = new_count
             logger.info(f"注册 {new_count} 个新 ASIN (总发现 {len(all_discovered)} 个, 去重后新增 {new_count})")
+
+    # ------------------------------------------------------------------
+    # 发现源兜底: Keepa Product Finder
+    # ------------------------------------------------------------------
+
+    def _product_finder_due(self, cooldown_hours: float) -> bool:
+        """根据状态文件判断 Product Finder 是否已过冷却期。"""
+        if cooldown_hours <= 0:
+            return True
+        try:
+            text = self.product_finder_cooldown_state_file.read_text(encoding="utf-8").strip()
+            last_run = datetime.fromisoformat(text)
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+        except (FileNotFoundError, ValueError, OSError):
+            return True
+        elapsed = (datetime.now(timezone.utc) - last_run).total_seconds()
+        return elapsed >= cooldown_hours * 3600
+
+    def _mark_product_finder_run(self) -> None:
+        """记录本次 Product Finder 运行时间。"""
+        try:
+            self.product_finder_cooldown_state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.product_finder_cooldown_state_file.write_text(
+                datetime.now(timezone.utc).isoformat(),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logger.warning(f"写入 Product Finder 冷却状态失败: {e}")
+
+    def _build_product_finder_selection(self, top_n: int) -> dict:
+        """构建符合中小跨境卖家经营范围的 Product Finder 过滤条件。
+
+        以站点价格带 (``_DOMAIN_PRICE_BANDS``) 锁定客单价区间, 叠加销量排名上限与
+        月销量下限, 优先圈出"有真实销量、价格适中"的可经营商品。所有阈值可经
+        AUTO_PRODUCT_FINDER_* 环境变量调整。
+        """
+        min_price, max_price = _DOMAIN_PRICE_BANDS.get(self.domain, (15.0, 60.0))
+        try:
+            sales_rank_max = max(1, int(os.environ.get("AUTO_PRODUCT_FINDER_SALES_RANK_MAX", "80000") or "80000"))
+        except ValueError:
+            sales_rank_max = 80000
+        try:
+            monthly_sold_min = max(0, int(os.environ.get("AUTO_PRODUCT_FINDER_MONTHLY_SOLD_MIN", "100") or "100"))
+        except ValueError:
+            monthly_sold_min = 100
+        # Keepa 价格单位为分(cent)
+        selection: dict[str, Any] = {
+            "current_NEW_gte": int(min_price * 100),
+            "current_NEW_lte": int(max_price * 100),
+            "current_SALES_gte": 1,           # 必须有销量排名 (在售且有销量)
+            "current_SALES_lte": sales_rank_max,
+            "sort": [["current_SALES", "asc"]],  # 销量排名靠前者优先
+            "perPage": top_n,
+            "page": 0,
+        }
+        if monthly_sold_min > 0:
+            selection["monthlySold_gte"] = monthly_sold_min
+        return selection
+
+    def _discover_via_product_finder(self, *, interactive_pending: bool) -> list[dict]:
+        """通过 Keepa Product Finder 批量发现 ASIN (BestSeller 枯竭时的机制性兜底)。
+
+        默认关闭, 需显式置 ``AUTO_PRODUCT_FINDER_ENABLED=true`` 开启。
+        受 token 预算与按站点冷却 (``AUTO_PRODUCT_FINDER_COOLDOWN_HOURS``) 约束,
+        避免在每轮调度中重复消耗 token。
+
+        Returns
+        -------
+        list[dict]
+            待注册的 ASIN 记录 (交由上层统一 register_asins 去重注册); 未触发时返回 []。
+        """
+        enabled = (os.environ.get("AUTO_PRODUCT_FINDER_ENABLED", "false") or "false").strip().lower()
+        if enabled not in ("1", "true", "yes", "on"):
+            return []
+
+        try:
+            cooldown_hours = max(0.0, float(os.environ.get("AUTO_PRODUCT_FINDER_COOLDOWN_HOURS", "24") or "24"))
+        except ValueError:
+            cooldown_hours = 24.0
+        if not self._product_finder_due(cooldown_hours):
+            logger.info(
+                "Product Finder 仍在冷却期 (冷却 %.0fh), 本轮跳过", cooldown_hours
+            )
+            return []
+
+        try:
+            top_n = max(1, int(os.environ.get("AUTO_PRODUCT_FINDER_TOP_N", "200") or "200"))
+        except ValueError:
+            top_n = 200
+
+        # token 预算检查 (Product Finder 约 10 token / 次)
+        try:
+            token_info = self.collector.check_token_status()
+            tokens_left = token_info.get("tokens_left", 0)
+        except Exception:
+            tokens_left = 0
+        decision = self.token_allocator.can_run(
+            queue_name="auto_discovery",
+            tokens_left=tokens_left,
+            cost=max(PRODUCT_FINDER_TOKENS_PER_QUERY, self.min_tokens_reserve),
+            interactive_pending=interactive_pending,
+        )
+        if not decision.allowed:
+            logger.info(
+                "token 预算不足 (%s), 本轮跳过 Product Finder 发现", decision.reason
+            )
+            return []
+
+        selection = self._build_product_finder_selection(top_n)
+        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(
+            "Product Finder: domain=%s selection=%s token=%s",
+            self.domain, json.dumps(selection, separators=(",", ":")), tokens_left,
+        )
+        try:
+            asins, raw_payload = self.discovery.find_products(
+                selection=selection, domain=self.domain
+            )
+        except Exception as e:
+            logger.warning(f"Product Finder 发现失败: {e}")
+            self._stats["errors"].append(f"product_finder: {e}")
+            # 失败也写冷却, 避免短时间内反复重试消耗 token
+            self._mark_product_finder_run()
+            return []
+
+        asins = list(dict.fromkeys(a for a in asins if a))[:top_n]
+        try:
+            tokens_after = self.collector.check_token_status().get("tokens_left", tokens_left)
+        except Exception:
+            tokens_after = max(0, tokens_left - PRODUCT_FINDER_TOKENS_PER_QUERY)
+        tokens_consumed = max(0, tokens_left - tokens_after)
+
+        raw_path = _save_raw_response(
+            raw_payload,
+            category="product_finder",
+            label=f"domain_{self.domain}",
+            domain=self.domain,
+            asins=asins,
+        )
+        if raw_path:
+            self.storage.upsert_asin_raw_file_mappings(
+                asins=asins,
+                domain=self.domain,
+                source="product_finder",
+                raw_file_path=raw_path,
+            )
+        try:
+            self.storage.log_collection(
+                source="product_finder",
+                domain=self.domain,
+                asins_requested=len(asins),
+                asins_succeeded=len(asins),
+                rows_ingested=0,
+                tokens_before=tokens_left,
+                tokens_after=tokens_after,
+                tokens_consumed=tokens_consumed,
+                duration_seconds=None,
+                raw_file_path=str(raw_path) if raw_path else None,
+                error_message=None,
+                started_at=started_at,
+            )
+        except Exception as e:
+            logger.warning(f"写入 Product Finder 日志失败: {e}")
+
+        self._mark_product_finder_run()
+        logger.info(
+            "Product Finder: 发现 %s 个 ASIN, 消耗 %s token", len(asins), tokens_consumed
+        )
+        return [
+            {
+                "asin": asin,
+                "domain": self.domain,
+                "discovery_source": "product_finder",
+            }
+            for asin in asins
+        ]
 
     # ------------------------------------------------------------------
     # Phase 2: 采集历史数据
@@ -1633,16 +1826,29 @@ class AutoCollector:
                 logger.warning(f"写入 L2/L3/L4 扩张日志失败: {e}")
 
     def _expand_keywords(self) -> None:
+        try:
+            trends_min_coverage = min(
+                1.0,
+                max(0.0, float(os.environ.get("AUTO_STRATEGY_KEYWORD_TRENDS_MIN_COVERAGE", "0.15") or "0.15")),
+            )
+        except ValueError:
+            trends_min_coverage = 0.15
         candidates = self.storage.get_keyword_expansion_candidates(
             domain=self.domain,
             limit=self.strategy_keyword_limit,
             cooldown_hours=self.strategy_keyword_cooldown_hours,
+            trends_min_coverage=trends_min_coverage,
         )
         if not candidates:
             logger.info("未找到可扩张的 keyword")
             return
 
-        logger.info(f"keyword 扩张候选 {len(candidates)} 个")
+        fallback = bool(candidates[0].get("trends_fallback_mode"))
+        logger.info(
+            "keyword 扩张候选 %s 个%s",
+            len(candidates),
+            "（无 Trends 兜底模式：按商品侧信号排序）" if fallback else "",
+        )
         for index, candidate in enumerate(candidates):
             try:
                 token_info = self.collector.check_token_status()

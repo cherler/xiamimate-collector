@@ -19,12 +19,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 import os
 from pathlib import Path
 from typing import Any
 import json
 
 from .seller_scope import evaluate_seller_scope
+
+logger = logging.getLogger(__name__)
 
 try:
     import duckdb
@@ -73,6 +76,19 @@ _BESTSELLER_REFRESH_DEFAULT_DAYS = 14
 _BESTSELLER_REFRESH_DOMAIN_DAYS = {
     1: 7,
 }
+
+
+def _bestseller_min_product_count() -> int:
+    """L1 BestSeller 纳入门槛 (product_count 下限)。
+
+    通过 ``AUTO_BESTSELLER_MIN_PRODUCT_COUNT`` 可调；默认下调到 20000 以纳入更多
+    中小 L1 类目作为发现源 (原 50000 偏严)。``get_next_category_for_bestseller``
+    与 ``get_category_stats`` 共用该门槛，确保 pending 计数与实际队列一致。
+    """
+    try:
+        return max(0, int(os.environ.get("AUTO_BESTSELLER_MIN_PRODUCT_COUNT", "20000") or "20000"))
+    except ValueError:
+        return 20000
 
 
 def _build_dynamic_stale_hours_sql(default_stale_hours: int) -> str:
@@ -890,7 +906,7 @@ class DuckDBStorage:
     def get_next_category_for_bestseller(self, domain: int = 1) -> dict | None:
         """获取下一个需要拉取 BestSeller 的类目.
 
-        策略: 仅 L1 类目, product_count >= 50000.
+        策略: 仅 L1 类目, product_count >= AUTO_BESTSELLER_MIN_PRODUCT_COUNT (默认 20000).
         从未拉取过或已到刷新时间的类目会重新进入队列.
 
         Returns
@@ -898,12 +914,13 @@ class DuckDBStorage:
         dict or None
             {'category_id': ..., 'category_en': ..., 'category_cn': ..., 'product_count': ..., 'depth': ...}
         """
+        min_product_count = _bestseller_min_product_count()
         row = self.conn.execute(
             """SELECT category_id, category_en, category_cn, product_count, depth
                FROM curated.keepa_category_registry
                WHERE domain = ? AND is_active = TRUE
                  AND depth = 1
-                 AND product_count >= 50000
+                 AND product_count >= ?
                  AND (
                      bestseller_fetched_at IS NULL
                      OR bestseller_next_refresh_at IS NULL
@@ -914,7 +931,7 @@ class DuckDBStorage:
                  COALESCE(bestseller_next_refresh_at, TIMESTAMP '1970-01-01') ASC,
                  product_count DESC
                LIMIT 1""",
-            [domain],
+            [domain, min_product_count],
         ).fetchone()
         if not row:
             return None
@@ -969,29 +986,30 @@ class DuckDBStorage:
     def get_category_stats(self, domain: int = 1) -> dict:
         """获取类目注册表统计.
 
-        只统计符合 BestSeller 条件的类目 (depth=1, product_count >= 50000).
+        只统计符合 BestSeller 条件的类目 (depth=1, product_count >= AUTO_BESTSELLER_MIN_PRODUCT_COUNT).
         """
+        min_product_count = _bestseller_min_product_count()
         total = self.conn.execute(
             """SELECT COUNT(*) FROM curated.keepa_category_registry
-               WHERE domain = ? AND is_active = TRUE AND depth = 1 AND product_count >= 50000""",
-            [domain],
+               WHERE domain = ? AND is_active = TRUE AND depth = 1 AND product_count >= ?""",
+            [domain, min_product_count],
         ).fetchone()[0]
         fetched = self.conn.execute(
             """SELECT COUNT(*) FROM curated.keepa_category_registry
                WHERE domain = ? AND is_active = TRUE AND bestseller_fetched_at IS NOT NULL
-                 AND depth = 1 AND product_count >= 50000""",
-            [domain],
+                 AND depth = 1 AND product_count >= ?""",
+            [domain, min_product_count],
         ).fetchone()[0]
         pending = self.conn.execute(
             """SELECT COUNT(*) FROM curated.keepa_category_registry
                WHERE domain = ? AND is_active = TRUE
-                 AND depth = 1 AND product_count >= 50000
+                 AND depth = 1 AND product_count >= ?
                  AND (
                      bestseller_fetched_at IS NULL
                      OR bestseller_next_refresh_at IS NULL
                      OR bestseller_next_refresh_at <= CURRENT_TIMESTAMP
                  )""",
-            [domain],
+            [domain, min_product_count],
         ).fetchone()[0]
         total_all = self.conn.execute(
             "SELECT COUNT(*) FROM curated.keepa_category_registry WHERE domain = ? AND is_active = TRUE",
@@ -1587,8 +1605,16 @@ class DuckDBStorage:
         cooldown_hours: int = 72,
         min_mapped_asins: int = 3,
         max_mapped_asins: int = 50,
+        trends_min_coverage: float = 0.15,
     ) -> list[dict[str, Any]]:
-        """返回下一阶段 keyword 扩张候选队列."""
+        """返回下一阶段 keyword 扩张候选队列.
+
+        正常情况下以 Google Trends 信号 (近 30 天热度/增长) 为主导筛选与排序。
+        当 Trends 数据源塌缩/限流导致近 30 天覆盖过低时 (覆盖率 < ``trends_min_coverage``)，
+        自动进入"无 Trends 兜底"模式：跳过 trend 硬门槛，改用商品侧信号
+        (已映射 ASIN 的 business_priority / P0 锚点 / 映射数量 / 类目匹配) 排序，
+        避免扩张引擎因单一数据源缺失而整体停摆；Trends 恢复后自动回到趋势驱动模式。
+        """
         rows = self.conn.execute(
             f"""
             WITH mapped AS (
@@ -1672,6 +1698,17 @@ class DuckDBStorage:
             "l2_category_count", "l3_category_count", "max_business_priority",
             "trend_30d_avg", "last_7d_avg", "prev_7d_avg", "hot_days_over_30d_avg", "last_run_at",
         ]
+        trend_col = columns.index("trend_30d_avg")
+        total_rows = len(rows)
+        rows_with_trend = sum(1 for row in rows if row[trend_col] is not None)
+        trends_coverage = (rows_with_trend / total_rows) if total_rows else 0.0
+        trends_fallback_mode = total_rows > 0 and trends_coverage < trends_min_coverage
+        if trends_fallback_mode:
+            logger.warning(
+                "keyword 扩张: 近 30 天 Trends 覆盖率仅 %.0f%% (%d/%d) < %.0f%%，"
+                "进入无 Trends 兜底模式，改用商品侧信号排序 (domain=%s)",
+                trends_coverage * 100, rows_with_trend, total_rows, trends_min_coverage * 100, domain,
+            )
         candidates: list[dict[str, Any]] = []
         for row in rows:
             item = dict(zip(columns, row))
@@ -1692,65 +1729,82 @@ class DuckDBStorage:
             l2_count = int(item.get("l2_category_count") or 0)
             l3_count = int(item.get("l3_category_count") or 0)
 
-            # --- hard filters ---
-            # 1. 基础热度门槛
-            if trend_30d_avg < 10:
-                continue
-            # 2. 高热度 (≥25) 可直接入选; 中等热度需有增长趋势 (≥1.05)
-            is_high_heat = trend_30d_avg >= 25
-            is_growing = trend_growth_7d is not None and trend_growth_7d >= 1.05
-            if not is_high_heat and not is_growing:
-                continue
-            # 3. 关键词最短长度
+            # 关键词最短长度 (两种模式共用的基础门槛)
             if len(str(item.get("keyword") or "").strip()) < 4:
                 continue
 
-            # --- scoring: 趋势信号权重占主导 ---
-            # 绝对热度 (0-4)
-            if trend_30d_avg >= 50:
-                trend_level_score = 4
-            elif trend_30d_avg >= 30:
-                trend_level_score = 3
-            elif trend_30d_avg >= 20:
-                trend_level_score = 2
-            else:
-                trend_level_score = 1
-
-            # 增长势头 (0-4)
-            if trend_growth_7d is not None and trend_growth_7d >= 1.30:
-                trend_growth_score = 4
-            elif trend_growth_7d is not None and trend_growth_7d >= 1.15:
-                trend_growth_score = 3
-            elif trend_growth_7d is not None and trend_growth_7d >= 1.05:
-                trend_growth_score = 2
-            elif trend_growth_7d is not None and trend_growth_7d >= 1.0:
-                trend_growth_score = 1
-            else:
-                trend_growth_score = 0
-
-            # hot_days 加分 (0-2), 不再作为硬门槛
-            hot_days_score = 2 if hot_days >= 4 else 1 if hot_days >= 2 else 0
-
-            # 覆盖度 (1-2)
+            # 商品侧信号 (两种模式共用)
             coverage_gap_score = 2 if 3 <= mapped_asins <= 20 else 1
-            # 质量锚点 (0-2)
             quality_anchor_score = 2 if mapped_p0 >= 1 else 1 if max_priority >= 70 else 0
-            # 类目匹配 (0-1)
             category_match_score = 1 if (l2_count >= 1 or l3_count >= 1) else 0
 
-            # 总分: 趋势 (0-10) + 商品侧 (0-5) → 趋势信号占 2/3 权重
-            expand_priority = (
-                trend_level_score
-                + trend_growth_score
-                + hot_days_score
-                + coverage_gap_score
-                + quality_anchor_score
-                + category_match_score
-            )
+            if trends_fallback_mode:
+                # --- 无 Trends 兜底：商品侧门槛 + 排序 ---
+                # 需有足够的商品侧价值锚点，避免在缺 Trends 时扩张低价值长尾词。
+                if quality_anchor_score == 0 and max_priority < 50:
+                    continue
+                trend_level_score = 0
+                trend_growth_score = 0
+                hot_days_score = 0
+                priority_score = 2 if max_priority >= 90 else 1 if max_priority >= 70 else 0
+                # 质量锚点占主导，叠加商品优先级/覆盖/类目匹配。
+                expand_priority = (
+                    quality_anchor_score * 3
+                    + priority_score
+                    + coverage_gap_score
+                    + category_match_score
+                )
+            else:
+                # --- trend 驱动 (硬门槛) ---
+                # 1. 基础热度门槛
+                if trend_30d_avg < 10:
+                    continue
+                # 2. 高热度 (≥25) 可直接入选; 中等热度需有增长趋势 (≥1.05)
+                is_high_heat = trend_30d_avg >= 25
+                is_growing = trend_growth_7d is not None and trend_growth_7d >= 1.05
+                if not is_high_heat and not is_growing:
+                    continue
+
+                # --- scoring: 趋势信号权重占主导 ---
+                # 绝对热度 (0-4)
+                if trend_30d_avg >= 50:
+                    trend_level_score = 4
+                elif trend_30d_avg >= 30:
+                    trend_level_score = 3
+                elif trend_30d_avg >= 20:
+                    trend_level_score = 2
+                else:
+                    trend_level_score = 1
+
+                # 增长势头 (0-4)
+                if trend_growth_7d is not None and trend_growth_7d >= 1.30:
+                    trend_growth_score = 4
+                elif trend_growth_7d is not None and trend_growth_7d >= 1.15:
+                    trend_growth_score = 3
+                elif trend_growth_7d is not None and trend_growth_7d >= 1.05:
+                    trend_growth_score = 2
+                elif trend_growth_7d is not None and trend_growth_7d >= 1.0:
+                    trend_growth_score = 1
+                else:
+                    trend_growth_score = 0
+
+                # hot_days 加分 (0-2), 不再作为硬门槛
+                hot_days_score = 2 if hot_days >= 4 else 1 if hot_days >= 2 else 0
+
+                # 总分: 趋势 (0-10) + 商品侧 (0-5) → 趋势信号占 2/3 权重
+                expand_priority = (
+                    trend_level_score
+                    + trend_growth_score
+                    + hot_days_score
+                    + coverage_gap_score
+                    + quality_anchor_score
+                    + category_match_score
+                )
 
             item.update(
                 {
                     "trend_growth_7d": trend_growth_7d,
+                    "trends_fallback_mode": trends_fallback_mode,
                     "trend_level_score": trend_level_score,
                     "trend_growth_score": trend_growth_score,
                     "hot_days_score": hot_days_score,

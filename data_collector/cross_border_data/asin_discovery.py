@@ -1,9 +1,10 @@
 """ASIN 发现 + 关键词提取.
 
-提供三种 ASIN 获取方式:
+提供四种 ASIN 获取方式:
 1. Keepa Best Sellers API (免费, 0 token) — 获取品类下 Top ASIN 列表
 2. Keepa Product Search API (按 10 token / 结果页预算) — 关键词搜索 ASIN
-3. 种子文件 — 手工维护的 ASIN 列表 CSV
+3. Keepa Product Finder API (/query, 约 10 token / 次) — 按价格/销量/排名等条件批量发现 ASIN
+4. 种子文件 — 手工维护的 ASIN 列表 CSV
 
 以及关键词提取:
 - 从 Keepa 返回的商品标题中自动提取 Google Trends 搜索词
@@ -12,6 +13,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from .utils import utc_now_text
 
 
 SEARCH_PRODUCTS_TOKENS_PER_PAGE = 10
+PRODUCT_FINDER_TOKENS_PER_QUERY = 10
 
 
 # 用于过滤标题中的噪音词
@@ -160,6 +163,47 @@ class KeepaAsinDiscovery:
         if asins_only:
             return payload.get("asinList") or []
         return payload.get("products") or []
+
+    def find_products(
+        self,
+        *,
+        selection: dict,
+        domain: int = 1,
+    ) -> tuple[list[str], dict]:
+        """Keepa Product Finder (/query): 按筛选条件批量发现 ASIN.
+
+        相比 BestSeller(只能按品类)和关键词搜索(只能按词), Product Finder
+        可直接用价格区间 / 销量排名 / 月销量 / 品类等结构化条件圈出符合
+        中小跨境卖家经营范围的 ASIN, 作为 BestSeller 枯竭 / 关键词扩张
+        受限时的机制性发现源兜底.
+
+        约 10 token / 次 (见 ``PRODUCT_FINDER_TOKENS_PER_QUERY``).
+
+        Parameters
+        ----------
+        selection : dict
+            Keepa Product Finder 过滤 JSON, 例如
+            ``{"current_NEW_gte": 1500, "current_NEW_lte": 6000,
+               "current_SALES_lte": 80000, "monthlySold_gte": 100,
+               "sort": [["current_SALES", "asc"]], "perPage": 200, "page": 0}``。
+        domain : int
+            Amazon 站点 ID.
+
+        Returns
+        -------
+        tuple[list[str], dict]
+            (ASIN 列表, 原始 API 响应 payload)
+        """
+        payload = self._collector.get_json(
+            "https://api.keepa.com/query",
+            params={
+                "key": self.api_key,
+                "domain": domain,
+                "selection": json.dumps(selection, separators=(",", ":")),
+            },
+        )
+        asins = payload.get("asinList") or []
+        return asins, payload
 
     def check_tokens(self) -> dict:
         """检查剩余 token."""
