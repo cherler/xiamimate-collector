@@ -360,6 +360,18 @@ class AutoCollector:
             or os.environ.get("GOOGLE_TRENDS_MIHOMO_SECRET")
             or ""
         ).strip()
+        # 节点白名单过滤：机场绝大多数节点是普通数据中心 IP，访问 Google Trends 会 429/SSL 失败；
+        # 只有少数"谷歌学术"专线节点能稳定抓取 Trends。用逗号分隔的子串匹配，仅在命中的节点里轮换，
+        # 避免在 200+ 节点里盲目轮换极少命中可用专线节点。留空 = 不过滤(在全部候选里轮换)。
+        self.google_trends_mihomo_node_filter = [
+            token.strip()
+            for token in (
+                os.environ.get("AUTO_GOOGLE_TRENDS_MIHOMO_NODE_FILTER")
+                or os.environ.get("GOOGLE_TRENDS_MIHOMO_NODE_FILTER")
+                or ""
+            ).split(",")
+            if token.strip()
+        ]
         # 主动养 IP：每成功采集 N 批就主动切到下一个 Mihomo 节点，分摊单 IP 的请求频率，
         # 降低被 Google 标记限流的概率（0 = 关闭主动轮换，仅在 429/网络异常时被动切换）。
         try:
@@ -2046,6 +2058,8 @@ class AutoCollector:
     def _get_trends_collector(self):
         """Lazy init GoogleTrendsCollector (按 domain 设置正确的 hl)."""
         if self._trends_collector is None:
+            # 先确保当前 Mihomo 节点命中"谷歌学术"专线白名单，避免用普通节点初始化必失败。
+            self._ensure_trends_node_in_filter()
             try:
                 self._trends_collector = self._create_trends_collector()
             except ImportError:
@@ -2203,10 +2217,61 @@ class AutoCollector:
             body = response.read().decode("utf-8")
         return json.loads(body) if body else {}
 
+    def _ensure_trends_node_in_filter(self) -> bool:
+        """启动/采集前确保当前选中节点命中白名单过滤(如"谷歌学术"专线)。
+
+        机场默认选中节点往往是普通数据中心节点(访问 Trends 必 429/SSL)，若配置了节点
+        白名单且当前节点不在白名单内，则主动切到第一个匹配节点，避免首次采集就失败。
+        无过滤配置或控制器未配置时不做任何操作。
+        """
+        if not self.google_trends_mihomo_controller_url or not self.google_trends_mihomo_switch_group:
+            return False
+        if not self.google_trends_mihomo_node_filter:
+            return False
+        try:
+            proxies = self._mihomo_request("GET", "/proxies")
+            proxy_map = proxies.get("proxies", {})
+            group = proxy_map.get(self.google_trends_mihomo_switch_group) or {}
+            current = group.get("now") or ""
+            if current and any(token in current for token in self.google_trends_mihomo_node_filter):
+                return True  # 当前节点已命中白名单
+            matched = [
+                name
+                for name in group.get("all", [])
+                if name
+                and name not in {"DIRECT", "REJECT"}
+                and not (proxy_map.get(name) or {}).get("all")
+                and any(token in name for token in self.google_trends_mihomo_node_filter)
+            ]
+            if not matched:
+                logger.warning(
+                    "Google Trends Mihomo 分组 %s 无节点匹配过滤 %s，保持当前节点 %s",
+                    self.google_trends_mihomo_switch_group,
+                    self.google_trends_mihomo_node_filter,
+                    current,
+                )
+                return False
+            target = matched[0]
+            self._mihomo_request(
+                "PUT",
+                f"/proxies/{quote(self.google_trends_mihomo_switch_group, safe='')}",
+                {"name": target},
+            )
+            self._trends_collector = None
+            logger.info(
+                "Google Trends Mihomo 分组 %s 当前节点 %s 不在白名单，已切到 %s",
+                self.google_trends_mihomo_switch_group,
+                current or "(无)",
+                target,
+            )
+            return True
+        except Exception as e:
+            logger.warning("Google Trends Mihomo 确保白名单节点失败: %s", e)
+            return False
+
     def _rotate_google_trends_proxy_node(self) -> bool:
         if not self.google_trends_mihomo_controller_url or not self.google_trends_mihomo_switch_group:
             return False
-
         try:
             proxies = self._mihomo_request("GET", "/proxies")
             proxy_map = proxies.get("proxies", {})
@@ -2216,6 +2281,21 @@ class AutoCollector:
                 for name in group.get("all", [])
                 if name and name not in {"DIRECT", "REJECT"} and not (proxy_map.get(name) or {}).get("all")
             ]
+            # 仅保留命中节点白名单过滤(如"谷歌学术"专线)的候选；过滤后为空则回退到全部候选。
+            if self.google_trends_mihomo_node_filter:
+                filtered = [
+                    name
+                    for name in candidates
+                    if any(token in name for token in self.google_trends_mihomo_node_filter)
+                ]
+                if filtered:
+                    candidates = filtered
+                else:
+                    logger.warning(
+                        "Google Trends Mihomo 分组 %s 无节点匹配过滤 %s，回退全部候选",
+                        self.google_trends_mihomo_switch_group,
+                        self.google_trends_mihomo_node_filter,
+                    )
             if len(candidates) < 2:
                 logger.info(
                     "Google Trends Mihomo 分组 %s 可切换候选不足，跳过切节点",
