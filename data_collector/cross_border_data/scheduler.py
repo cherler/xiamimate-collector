@@ -138,8 +138,18 @@ def _duckdb_access_lock():
 _DOC_DIR = Path(__file__).resolve().parents[2] / "doc"
 _CATEGORY_CSV = _DOC_DIR / "amazon_us_category_tree.csv"  # 兼容旧引用
 
-# 产品数低于此阈值的类目不参与轮换 (过滤掉极小或空类目)
-_MIN_PRODUCT_COUNT = 50000
+# 产品数低于此阈值的类目不参与轮换 (过滤掉极小或空类目)。
+# 与 storage._bestseller_min_product_count() 共用 env，避免"注册门槛 50000、
+# 轮换门槛 20000"不一致导致放宽门槛形同虚设 (20000-50000 的类目从未被注册)。
+def _min_product_count() -> int:
+    """L1 类目纳入门槛: env AUTO_BESTSELLER_MIN_PRODUCT_COUNT, 默认 20000。"""
+    try:
+        return max(0, int(os.environ.get("AUTO_BESTSELLER_MIN_PRODUCT_COUNT", "20000") or "20000"))
+    except ValueError:
+        return 20000
+
+
+_MIN_PRODUCT_COUNT = _min_product_count()
 
 # 所有已支持的采集 domain
 ALL_DOMAINS = sorted(KEEPA_DOMAIN_TO_GEO.keys())  # [1,2,3,4,5,6,8,9,10,11,12,13]
@@ -425,20 +435,15 @@ class AutoCollector:
         }
 
     def _ensure_category_registry(self) -> None:
-        """首次运行时, 从 CSV 同步类目到 DuckDB keepa_category_registry."""
-        cat_stats = self.storage.get_category_stats(self.domain)
-        if cat_stats["total_categories"] > 0:
-            geo = KEEPA_DOMAIN_TO_GEO.get(self.domain, "?")
-            logger.info(
-                f"类目注册表 (domain={self.domain}/{geo}): "
-                f"{cat_stats['total_categories']} 个类目, "
-                f"已至少采过 BestSeller {cat_stats['bestseller_fetched']} 个, "
-                f"到期待刷新/未采集 {cat_stats['bestseller_pending']} 个"
-            )
-            return
+        """从 CSV 同步类目到 DuckDB keepa_category_registry.
 
-        # 表为空: 从 CSV 导入
+        每次启动都执行幂等同步 (sync_categories_from_csv 用 ON CONFLICT DO NOTHING,
+        不覆盖已存在/已停用的类目), 以便放宽 AUTO_BESTSELLER_MIN_PRODUCT_COUNT 后,
+        新达标的中小类目能被补登记并进入 BestSeller 轮换 (否则旧注册表只含历史高门槛
+        类目, 放宽门槛形同虚设)。
+        """
         csv_path = _get_category_csv_for_domain(self.domain)
+        geo = KEEPA_DOMAIN_TO_GEO.get(self.domain, "?")
         if csv_path.exists():
             new_count = self.storage.sync_categories_from_csv(
                 csv_path=csv_path,
@@ -446,10 +451,22 @@ class AutoCollector:
                 excluded_ids=_EXCLUDED_CATEGORY_IDS,
                 min_products=_MIN_PRODUCT_COUNT,
             )
-            geo = KEEPA_DOMAIN_TO_GEO.get(self.domain, "?")
-            logger.info(f"从 CSV 导入 {new_count} 个类目到 category_registry (domain={self.domain}/{geo})")
+            if new_count > 0:
+                logger.info(
+                    f"从 CSV 同步 {new_count} 个新类目到 category_registry "
+                    f"(domain={self.domain}/{geo}, product_count >= {_MIN_PRODUCT_COUNT})"
+                )
         else:
             logger.warning(f"类目 CSV 不存在: {csv_path}")
+
+        cat_stats = self.storage.get_category_stats(self.domain)
+        if cat_stats["total_categories"] > 0:
+            logger.info(
+                f"类目注册表 (domain={self.domain}/{geo}): "
+                f"{cat_stats['total_categories']} 个类目, "
+                f"已至少采过 BestSeller {cat_stats['bestseller_fetched']} 个, "
+                f"到期待刷新/未采集 {cat_stats['bestseller_pending']} 个"
+            )
 
     def run(self) -> dict[str, Any]:
         """执行完整的自动化采集流程.
