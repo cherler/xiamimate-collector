@@ -87,6 +87,30 @@ def _sql_string(value: str | Path) -> str:
     return str(value).replace("'", "''")
 
 
+def _configure_duckdb_runtime(conn: "duckdb.DuckDBPyConnection", source_db: Path) -> None:
+    """Cap DuckDB memory/threads so the weekly export cannot OOM the host.
+
+    DuckDB defaults memory_limit to ~80% of physical RAM and threads to all
+    cores; on the 14GB no-swap ECS2 box, running concurrently with auto-collect
+    that ballooned the export to ~10GB RSS and got it OOM-killed every weekly
+    run. Spill to a temp dir on the data disk when the cap is hit.
+    """
+    memory_limit = os.environ.get("FORECAST_FEATURE_EXPORT_DUCKDB_MEMORY_LIMIT", "4GB")
+    threads = os.environ.get("FORECAST_FEATURE_EXPORT_DUCKDB_THREADS", "2")
+    temp_directory = os.environ.get("FORECAST_FEATURE_EXPORT_DUCKDB_TEMP_DIR") or str(
+        source_db.parent / "duckdb_export_tmp"
+    )
+    Path(temp_directory).mkdir(parents=True, exist_ok=True)
+    conn.execute(f"SET memory_limit = '{_sql_string(memory_limit)}'")
+    conn.execute(f"SET threads = {int(threads)}")
+    conn.execute(f"SET temp_directory = '{_sql_string(temp_directory)}'")
+    print(
+        f"[forecast-feature-export] duckdb runtime memory_limit={memory_limit} "
+        f"threads={threads} temp_directory={temp_directory}",
+        flush=True,
+    )
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -416,6 +440,7 @@ def main() -> int:
 
     conn = duckdb.connect(str(source_db), read_only=True)
     try:
+        _configure_duckdb_runtime(conn, source_db)
         domains = _discover_domains(conn, _parse_domains(args.domains))
         history_stats = _history_partition_stats(conn, domains=domains, history_days=args.history_days)
         registry_stats = _registry_partition_stats(conn, domains=domains)
