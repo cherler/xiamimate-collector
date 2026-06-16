@@ -60,10 +60,12 @@ _DOMAIN_PRICE_BANDS = {
     13: (25.0, 90.0),
 }
 
-_BUSINESS_TIER_REFRESH_WINDOWS_DAYS = {
-    "P0": (21, 30),
-    "P1": (45, 60),
-    "P2": (75, 90),
+# P0/P1/P2 重采窗口默认值 (min_days, max_days)，按 business_priority 在窗口内线性插值。
+# 可分层用环境变量覆盖：AUTO_REFRESH_WINDOW_{TIER}_MIN_DAYS / AUTO_REFRESH_WINDOW_{TIER}_MAX_DAYS。
+_DEFAULT_BUSINESS_TIER_REFRESH_WINDOWS_DAYS = {
+    "P0": (14, 21),
+    "P1": (30, 45),
+    "P2": (60, 75),
 }
 
 _BUSINESS_TIER_PRIORITY_WINDOWS = {
@@ -71,6 +73,10 @@ _BUSINESS_TIER_PRIORITY_WINDOWS = {
     "P1": (60, 80),
     "P2": (20, 40),
 }
+
+# Anchor 分层固定重采窗口默认天数；可通过 AUTO_REFRESH_WINDOW_ANCHOR_DAYS 覆盖。
+# 其余分层 (Drop / 未分层) 仍走 get_asins_to_fetch 的 stale_hours 兜底。
+_DEFAULT_ANCHOR_REFRESH_DAYS = 30
 
 _BESTSELLER_REFRESH_DEFAULT_DAYS = 14
 _BESTSELLER_REFRESH_DOMAIN_DAYS = {
@@ -91,9 +97,39 @@ def _bestseller_min_product_count() -> int:
         return 20000
 
 
+def _env_int(name: str, default: int) -> int:
+    """读取整数型环境变量，缺失或非法时回退默认值（并保证 >= 0）。"""
+    try:
+        return max(0, int(os.environ.get(name, str(default)) or str(default)))
+    except ValueError:
+        return default
+
+
+def _business_tier_refresh_windows_days() -> dict[str, tuple[int, int]]:
+    """返回 P0/P1/P2 重采窗口 (min_days, max_days)。
+
+    默认值见 ``_DEFAULT_BUSINESS_TIER_REFRESH_WINDOWS_DAYS``，可分层用环境变量覆盖：
+    ``AUTO_REFRESH_WINDOW_P0_MIN_DAYS`` / ``AUTO_REFRESH_WINDOW_P0_MAX_DAYS`` 等。
+    若 min > max 则自动交换，避免配置反了导致插值异常。
+    """
+    windows: dict[str, tuple[int, int]] = {}
+    for tier, (default_min, default_max) in _DEFAULT_BUSINESS_TIER_REFRESH_WINDOWS_DAYS.items():
+        min_days = _env_int(f"AUTO_REFRESH_WINDOW_{tier}_MIN_DAYS", default_min)
+        max_days = _env_int(f"AUTO_REFRESH_WINDOW_{tier}_MAX_DAYS", default_max)
+        if min_days > max_days:
+            min_days, max_days = max_days, min_days
+        windows[tier] = (min_days, max_days)
+    return windows
+
+
+def _anchor_refresh_window_hours() -> int:
+    """Anchor 分层固定重采窗口小时数；env AUTO_REFRESH_WINDOW_ANCHOR_DAYS，默认 30 天。"""
+    return _env_int("AUTO_REFRESH_WINDOW_ANCHOR_DAYS", _DEFAULT_ANCHOR_REFRESH_DAYS) * 24
+
+
 def _build_dynamic_stale_hours_sql(default_stale_hours: int) -> str:
     cases: list[str] = []
-    for tier, (min_days, max_days) in _BUSINESS_TIER_REFRESH_WINDOWS_DAYS.items():
+    for tier, (min_days, max_days) in _business_tier_refresh_windows_days().items():
         priority_min, priority_max = _BUSINESS_TIER_PRIORITY_WINDOWS[tier]
         min_hours = min_days * 24
         max_hours = max_days * 24
@@ -105,6 +141,10 @@ def _build_dynamic_stale_hours_sql(default_stale_hours: int) -> str:
                     )
                 ) AS BIGINT)"""
         )
+    # Anchor 用固定窗口 (business_priority 固定为 55，无需插值)。
+    cases.append(
+        f"WHEN business_tier = 'Anchor' THEN {int(_anchor_refresh_window_hours())}"
+    )
     return (
         "CASE\n"
         + "\n".join(cases)
@@ -591,11 +631,12 @@ class DuckDBStorage:
 
         优先级:
         1. 从未采集过的 ASIN (last_fetched_at IS NULL)
-        2. 已分层 ASIN 按 business_tier 动态重采窗口判定是否过期
-           - P0: 21-30 天
-           - P1: 45-60 天
-           - P2: 75-90 天
-           - Anchor / Drop / 其他分层 / 未分层: 使用 stale_hours 兜底，生产默认 60 天
+        2. 已分层 ASIN 按 business_tier 动态重采窗口判定是否过期 (天数均可用环境变量覆盖)
+           - P0: AUTO_REFRESH_WINDOW_P0_MIN/MAX_DAYS, 默认 14-21 天
+           - P1: AUTO_REFRESH_WINDOW_P1_MIN/MAX_DAYS, 默认 30-45 天
+           - P2: AUTO_REFRESH_WINDOW_P2_MIN/MAX_DAYS, 默认 60-75 天
+           - Anchor: AUTO_REFRESH_WINDOW_ANCHOR_DAYS, 默认 30 天 (固定窗口)
+           - Drop / 其他分层 / 未分层: 使用 stale_hours 兜底
         3. 按 business_priority / priority DESC, first_seen_at ASC 排序
 
         Returns

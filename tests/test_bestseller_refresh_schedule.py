@@ -2,6 +2,9 @@ from datetime import datetime, timedelta
 
 from data_collector.cross_border_data.storage import (
     DuckDBStorage,
+    _anchor_refresh_window_hours,
+    _build_dynamic_stale_hours_sql,
+    _business_tier_refresh_windows_days,
     _compute_bestseller_refresh_interval_days,
 )
 
@@ -68,3 +71,43 @@ def test_count_registered_asins_for_bestseller_new_rate(tmp_path) -> None:
 
     assert storage.count_registered_asins(["A1", "A2", "A3"], 1) == 2
     assert storage.count_registered_asins(["A1", "A2", "A3"], 2) == 1
+
+
+def test_refresh_windows_defaults(monkeypatch) -> None:
+    for tier in ("P0", "P1", "P2"):
+        monkeypatch.delenv(f"AUTO_REFRESH_WINDOW_{tier}_MIN_DAYS", raising=False)
+        monkeypatch.delenv(f"AUTO_REFRESH_WINDOW_{tier}_MAX_DAYS", raising=False)
+    monkeypatch.delenv("AUTO_REFRESH_WINDOW_ANCHOR_DAYS", raising=False)
+
+    windows = _business_tier_refresh_windows_days()
+    assert windows["P0"] == (14, 21)
+    assert windows["P1"] == (30, 45)
+    assert windows["P2"] == (60, 75)
+    assert _anchor_refresh_window_hours() == 30 * 24
+
+
+def test_refresh_windows_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("AUTO_REFRESH_WINDOW_P0_MIN_DAYS", "7")
+    monkeypatch.setenv("AUTO_REFRESH_WINDOW_P0_MAX_DAYS", "10")
+    monkeypatch.setenv("AUTO_REFRESH_WINDOW_ANCHOR_DAYS", "45")
+
+    windows = _business_tier_refresh_windows_days()
+    assert windows["P0"] == (7, 10)
+    assert _anchor_refresh_window_hours() == 45 * 24
+
+
+def test_refresh_windows_swaps_inverted_bounds(monkeypatch) -> None:
+    monkeypatch.setenv("AUTO_REFRESH_WINDOW_P1_MIN_DAYS", "60")
+    monkeypatch.setenv("AUTO_REFRESH_WINDOW_P1_MAX_DAYS", "30")
+
+    windows = _business_tier_refresh_windows_days()
+    assert windows["P1"] == (30, 60)
+
+
+def test_dynamic_stale_hours_sql_includes_anchor_branch(monkeypatch) -> None:
+    monkeypatch.delenv("AUTO_REFRESH_WINDOW_ANCHOR_DAYS", raising=False)
+    sql = _build_dynamic_stale_hours_sql(1440)
+    assert "WHEN business_tier = 'Anchor' THEN 720" in sql  # 30 天 * 24
+    assert "WHEN business_tier = 'P0'" in sql
+    assert "ELSE 1440" in sql
+
